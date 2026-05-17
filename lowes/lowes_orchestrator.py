@@ -194,6 +194,7 @@ def main():
     if os.environ["LOWES_PRODUCT_TYPE"] == "LDY":
         os.environ.setdefault("LOWES_SEARCH_TERM", "washing machine")
         os.environ.setdefault("LOWES_BSR_PRODUCT_GROUP", "LDY")
+        os.environ.setdefault("LOWES_REQUEST_VARIANT", "js_premium_block_visual")
     else:
         os.environ.setdefault("LOWES_SEARCH_TERM", "refrigerator")
         os.environ.setdefault("LOWES_BSR_PRODUCT_GROUP", "REF")

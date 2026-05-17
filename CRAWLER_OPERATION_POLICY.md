@@ -151,6 +151,59 @@ Each collection subject should follow this pattern when possible:
   benchmarks/
 ```
 
+## Development Attempt Logging Policy
+
+Every crawler development task and site-access experiment must leave a human
+audit trail in the channel development log.
+
+Default path:
+
+```text
+{retailer}_dev_log/{YYYYMMDD}_{retailer}_{product_type}_tests.md
+```
+
+Examples:
+
+```text
+lowes_dev_log/20260517_lowes_ldy_tests.md
+bestbuy_dev_log/20260517_bestbuy_hhp_tests.md
+```
+
+This log is separate from per-run runtime logs. Runtime logs answer "what did
+the script do while running?" Development logs answer "why did we try this, in
+what conditions, and what did we learn?"
+
+Record an entry whenever any of these happen:
+
+- crawler code is changed
+- selectors, parsers, request headers, cookies, browser settings, proxy options,
+  API transports, ZenRows parameters, retry settings, or timeouts are changed
+- a collection failure is investigated, bypassed, or retried
+- a site/API access path is tested
+- DB, S3, or local cleanup behavior is tested
+- a run produces a useful success, failure, or partial result
+
+Each entry should include:
+
+- local timestamp and timezone
+- channel/retailer, product type, step, and run root
+- command or code path used
+- relevant environment variables and request conditions
+- request variant, browser/API mode, proxy/header/cookie settings when relevant
+- result: success/failure, status code, row counts, elapsed time, and error body
+- raw artifact paths and manifest paths
+- files changed
+- interpretation and next recommended action
+
+Never write secrets to the development log. Redact API keys, passwords, database
+URLs, session cookies, authorization headers, and other credentials.
+
+Per-run logs should continue to be written under:
+
+```text
+{retailer}/data/{product_type}/{YYYYMMDD}/{subject}/logs/run.log
+```
+
 ## Raw Artifact Policy
 
 Raw artifacts are grouped by request unit, not dumped flat into one folder.

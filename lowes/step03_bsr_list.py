@@ -73,6 +73,50 @@ def html_product_cards(page_html):
     return cards
 
 
+def bsr_state_products(state):
+    page_products = state.get("productListCommonNormalizedPageSpecificProducts", {})
+    product_list = page_products.get("productList", {}) if isinstance(page_products, dict) else {}
+    products = product_list.get("products", {}) if isinstance(product_list, dict) else {}
+    return products if isinstance(products, list) else []
+
+
+def parse_bsr_state_product(item, rank, bsr_rank):
+    product = item.get("product", {}) if isinstance(item, dict) else {}
+    price = item.get("price", {}) if isinstance(item, dict) else {}
+    pd_url = product.get("pdURL", "")
+    match = re.search(r"/(\d{7,})(?:[/?#].*)?$", pd_url or "")
+    omni_item_id = match.group(1) if match else ""
+    alt = product.get("alt", "") or product.get("description", "")
+    model_match = re.search(r"#([A-Za-z0-9._-]+)\s*$", alt)
+    image_urls = product.get("imageUrls") or []
+    image_url = ""
+    if isinstance(image_urls, list):
+        for image in image_urls:
+            if isinstance(image, dict) and image.get("value"):
+                image_url = urljoin("https://mobileimages.lowes.com", image["value"])
+                break
+    final_price = price.get("finalPriceCentForUi", "")
+    return {
+        "product_group": PRODUCT_GROUP,
+        "bsr_rank": bsr_rank,
+        "page": 1,
+        "rank_in_page": rank,
+        "main_rank": bsr_rank,
+        "omni_item_id": omni_item_id,
+        "item_number": omni_item_id,
+        "brand": product.get("brand", ""),
+        "model_id": model_match.group(1) if model_match else "",
+        "description": product.get("description", ""),
+        "product_url": urljoin("https://www.lowes.com", pd_url),
+        "image_url": image_url,
+        "rating": product.get("rating", ""),
+        "review_count": product.get("count", ""),
+        "selling_price": final_price,
+        "price_source": "bsr_preloaded_state" if final_price != "" else "",
+        "raw_item_json": json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+    }
+
+
 def fetch_bsr():
     api_key = os.getenv("ZENROWS_API_KEY")
     if not api_key:
@@ -179,6 +223,14 @@ def write_csv(rows):
 
 def parse_bsr(page_html):
     state = extract_preloaded_state(page_html)
+    bsr_products = bsr_state_products(state)
+    if bsr_products:
+        rows = []
+        for rank, item in enumerate(bsr_products, 1):
+            bsr_rank = BSR_OFFSET + rank
+            rows.append(parse_bsr_state_product(item, rank, bsr_rank))
+        return rows, {"source": "bsr_preloaded_state", "item_count": len(bsr_products)}
+
     items = find_item_list(state) or []
     html_prices = product_card_prices(page_html)
     rows = []

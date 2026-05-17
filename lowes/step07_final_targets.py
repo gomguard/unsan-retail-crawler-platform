@@ -38,6 +38,7 @@ def rank_lookup(rows):
 def build_final_targets(main_rows, bsr_rows):
     bsr_by_id = rank_lookup(bsr_rows)
     output = []
+    seen = set()
     for row in main_rows:
         out = dict(row)
         product_id = out.get("omni_item_id") or out.get("item_number") or out.get("product_url")
@@ -46,6 +47,21 @@ def build_final_targets(main_rows, bsr_rows):
         out["bsr_rank"] = bsr.get("bsr_rank", out.get("bsr_rank", ""))
         out["bsr_product_group"] = bsr.get("product_group", out.get("bsr_product_group", ""))
         output.append(out)
+        if product_id:
+            seen.add(product_id)
+    for row in bsr_rows:
+        product_id = row.get("omni_item_id") or row.get("item_number") or row.get("product_url")
+        if product_id and product_id in seen:
+            continue
+        out = dict(row)
+        out["final_target_rank"] = len(output) + 1
+        out.setdefault("target_rank", out["final_target_rank"])
+        out.setdefault("selection_source", "bsr")
+        out["bsr_rank"] = out.get("bsr_rank", "")
+        out["bsr_product_group"] = out.get("product_group", out.get("bsr_product_group", ""))
+        output.append(out)
+        if product_id:
+            seen.add(product_id)
     return output
 
 

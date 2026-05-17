@@ -37,6 +37,11 @@ MAX_ATTEMPTS = int(os.getenv("LOWES_MAX_ATTEMPTS", "2"))
 RETRY_SLEEP_SECONDS = int(os.getenv("LOWES_RETRY_SLEEP_SECONDS", "10"))
 MAIN_SOURCE = os.getenv("LOWES_MAIN_SOURCE", "html").strip().lower()
 REQUEST_VARIANT = os.getenv("LOWES_REQUEST_VARIANT", "auto").strip().lower()
+BLOCK_RESOURCES = os.getenv("LOWES_BLOCK_RESOURCES", "image,media,font,stylesheet").strip()
+ANTIBOT = os.getenv("LOWES_ZENROWS_ANTIBOT", "true").strip().lower()
+HTML_CUSTOM_HEADERS = os.getenv("LOWES_HTML_CUSTOM_HEADERS", "true").strip().lower() in {"1", "true", "yes", "y"}
+WAIT_FOR_SELECTOR = os.getenv("LOWES_WAIT_FOR_SELECTOR", ".content").strip()
+WAIT_MS = os.getenv("LOWES_WAIT_MS", "2500").strip()
 API_CURL_FILE = os.getenv("LOWES_API_CURL_FILE", "").strip()
 API_TRANSPORT = os.getenv("LOWES_API_TRANSPORT", "curl" if API_CURL_FILE else "zenrows").strip().lower()
 API_INITIAL_ADJUSTED_OFFSET = os.getenv("LOWES_API_INITIAL_ADJUSTED_OFFSET", "").strip()
@@ -73,10 +78,17 @@ REQUEST_VARIANTS = {
     },
     "js_premium_block_visual": {
         "js_render": "true",
+        "antibot": ANTIBOT,
         "premium_proxy": "true",
         "proxy_country": "us",
         "wait": "8000",
-        "block_resources": "image,media,font,stylesheet",
+        "block_resources": BLOCK_RESOURCES,
+    },
+    "js_premium_content_fast": {
+        "js_render": "true",
+        "premium_proxy": "true",
+        "wait_for": WAIT_FOR_SELECTOR,
+        "wait": WAIT_MS,
     },
 }
 
@@ -211,6 +223,30 @@ def api_headers():
     return headers
 
 
+def html_headers():
+    headers = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "referer": LOWES_BASE_URL + "/",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        ),
+        "cookie": build_store_cookie(),
+    }
+    curl_data = curl_file_data()
+    if curl_data.get("cookie"):
+        headers["cookie"] = curl_data["cookie"]
+    return headers
+
+
 def make_dirs():
     for subdir in ["raw/main_pages", "parsed", "benchmarks", "logs"]:
         (RUN_ROOT / subdir).mkdir(parents=True, exist_ok=True)
@@ -243,13 +279,17 @@ def fetch_once(task, attempt):
     page_number, offset = task
     url = build_url(offset)
     client = zenrows_client()
-    params = REQUEST_VARIANTS.get(REQUEST_VARIANT)
-    if params is None:
+    variant_params = REQUEST_VARIANTS.get(REQUEST_VARIANT)
+    if variant_params is None:
         raise ValueError(f"Unknown LOWES_REQUEST_VARIANT={REQUEST_VARIANT}")
+    params = dict(variant_params)
+    headers = html_headers() if HTML_CUSTOM_HEADERS else {}
+    if headers:
+        params["custom_headers"] = "true"
     started = datetime.now().isoformat(timespec="seconds")
     start = time.time()
     try:
-        response = client.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response = client.get(url, params=params, headers=headers or None, timeout=REQUEST_TIMEOUT)
         elapsed = time.time() - start
         return {
             "page": page_number,
@@ -261,6 +301,8 @@ def fetch_once(task, attempt):
             "elapsed_seconds": round(elapsed, 3),
             "status_code": response.status_code,
             "headers": dict(response.headers),
+            "request_params": params,
+            "request_custom_headers": bool(headers),
             "text": response.text,
             "content_kind": "html",
             "error": "",
@@ -277,6 +319,8 @@ def fetch_once(task, attempt):
             "elapsed_seconds": round(elapsed, 3),
             "status_code": "",
             "headers": {},
+            "request_params": params,
+            "request_custom_headers": bool(headers),
             "text": "",
             "content_kind": "html",
             "error": str(exc),
@@ -371,6 +415,11 @@ def save_attempt(result):
                 "url": result.get("url", ""),
                 "source": result.get("source", ""),
                 "transport": result.get("transport", ""),
+                "request_variant": REQUEST_VARIANT,
+                "request_params": result.get("request_params", {}),
+                "custom_headers": result.get("request_custom_headers", False),
+                "store_id": API_STORE_ID if result.get("request_custom_headers") else "",
+                "store_zip": API_STORE_ZIP if result.get("request_custom_headers") else "",
             },
             indent=2,
             ensure_ascii=False,
