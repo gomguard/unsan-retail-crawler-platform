@@ -1,0 +1,13 @@
+category_key,key,url,description,enabled
+TV,main_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&st=tv,Best Match TV search/list page,true
+TV,bsr_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&sp=Best-Selling&st=tv,Best Selling TV search/list page,true
+TV,promotion_tv_home_theater,https://www.bestbuy.com/site/all-tv-home-theater-on-sale/tvs-on-sale/pcmcat1720647543741.c?id=pcmcat1720647543741,TV promotion/deals page,true
+TV,trending_tvs_projectors,https://www.bestbuy.com/discover/trending-deals/trending-deals-tvs-projectors/pcmcat1752523988655,Trending Deals in TVs & Projectors page,true
+HHP,main_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&st=cellphone,Best Match cellphone search/list page,true
+HHP,bsr_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&sp=Best-Selling&st=cellphone,Best Selling cellphone search/list page,true
+HHP,promotion_tv_home_theater,https://www.bestbuy.com/site/all-electronics-on-sale/all-cell-phones-on-sale/pcmcat1690895861552?cp={page}&id=pcmcat1690895861552,Cell phones promotion/deals page,true
+HHP,trending_tvs_projectors,https://www.bestbuy.com/discover/trending-deals/trending-deals-cell-phones-accessories/pcmcat1752522354177,Trending Deals in Cell Phones & Accessories page,true
+REF,main_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&st=refrigerator,Best Match refrigerator search/list page,true
+REF,bsr_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&sp=Best-Selling&st=refrigerator,Best Selling refrigerator search/list page,true
+LDY,main_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&st=washing+machine,Best Match washing machine search/list page,true
+LDY,bsr_search,https://www.bestbuy.com/site/searchpage.jsp?cp={page}&id=pcat17071&sp=Best-Selling&st=washing+machine,Best Selling washing machine search/list page,true

@@ -1,0 +1,84 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Local crawler data and raw artifacts
+data/
+*/data/
+bestbuy/data/
+lowes/data/
+amazon/data/
+walmart/data/
+archive/
+backup/
+
+# Generated crawler outputs in repo root
+*_parsed_pages_*.csv
+*_final_output*.csv
+*_response*.json
+*_response*.txt
+*_headers*.json
+*_meta*.json
+
+# Local captures and bulky references
+.claude/
+*.zip
+~$*
+references/*_sample.html
+references/*_curl_*.txt
+lowes/references/*_curl_*.txt
+references/*.xlsx
+lowes/references/*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak

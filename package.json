@@ -1,0 +1,17 @@
+{
+  "name": "samsung_crawl",
+  "version": "1.0.0",
+  "description": "최근 72시간 기준 TV 관련 인기 영상을 수집하여 채널별 랭킹을 산출하는 POC입니다.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.60.0",
+    "puppeteer-core": "^25.0.2"
+  }
+}

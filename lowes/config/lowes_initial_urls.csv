@@ -1,0 +1,5 @@
+key,url,enabled,product_line,note
+main_search_refrigerator,https://www.lowes.com/search?searchTerm=refrigerator,true,REF,Main search source for refrigerator ranking
+main_search_washing_machine,https://www.lowes.com/search?searchTerm=washing+machine,true,LDY,Main search source for laundry ranking
+bsr_refrigerators,https://www.lowes.com/best-sellers/appliances/refrigerators/4294857973,true,REF,Best-seller ranking source for refrigerators
+bsr_washing_machines,https://www.lowes.com/best-sellers/appliances/washers-dryers/washing-machines/4294857977,true,LDY,Best-seller ranking source for laundry

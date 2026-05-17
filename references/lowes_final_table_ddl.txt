@@ -1,0 +1,28 @@
+-- Lowe's final-output working table.
+-- Until a retailer-specific wide DDL is provided, final_output.csv rows are
+-- loaded losslessly into row_json and common searchable fields are projected
+-- into typed/indexed columns.
+
+CREATE TABLE IF NOT EXISTS public.ref_retail_com_lowes (
+  id bigserial PRIMARY KEY,
+  product_type varchar(20),
+  run_date varchar(8),
+  batch_id varchar(80),
+  omni_item_id text,
+  item_number text,
+  brand text,
+  model_id text,
+  main_rank integer,
+  bsr_rank integer,
+  final_target_rank integer,
+  product_url text,
+  retailer_sku_name text,
+  final_selling_price text,
+  final_price_source text,
+  row_json jsonb NOT NULL,
+  loaded_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.ldy_retail_com_lowes (
+  LIKE public.ref_retail_com_lowes INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES
+);

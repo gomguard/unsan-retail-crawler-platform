@@ -1,0 +1,5 @@
+enabled,marketplace,product_line,key,url
+true,US,TV,main_search_tv,https://www.amazon.com/s?k=tv
+true,US,TV,bsr_tv,https://www.amazon.com/Best-Sellers-Electronics-Televisions/zgbs/electronics/172659
+true,US,HHP,main_search_tv,https://www.amazon.com/s?k=cellphone&page={page}&xpid=d6bhRHR4KHt44&crid=3C0XKQDVBSQ4W&qid=1764078752&sprefix=cellphon%2Caps%2C590&ref=sr_pg_{page}
+true,US,HHP,bsr_tv,https://www.amazon.com/Best-Sellers-Cell-Phones-Accessories-Cell-Phones/zgbs/wireless/7072561011/ref=zg_bs_pg_{page}_wireless?_encoding=UTF8&pg={page}

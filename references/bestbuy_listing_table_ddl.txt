@@ -1,0 +1,68 @@
+-- public.bby_tv_product_list definition
+
+-- Drop table
+
+-- DROP TABLE public.bby_tv_product_list;
+
+CREATE TABLE public.bby_tv_product_list (
+	id serial4 NOT NULL,
+	account_name varchar(50) NOT NULL,
+	page_type varchar(50) NOT NULL,
+	retailer_sku_name text NULL,
+	offer varchar(100) NULL,
+	pick_up_availability varchar(100) NULL,
+	fastest_delivery varchar(100) NULL,
+	delivery_availability varchar(100) NULL,
+	sku_status varchar(100) NULL,
+	promotion_type varchar(100) NULL,
+	trend_rank int4 NULL,
+	main_rank int4 NULL,
+	bsr_rank int4 NULL,
+	product_url text NULL,
+	calendar_week varchar(10) NULL,
+	crawl_datetime varchar(50) NULL,
+	batch_id varchar(50) NULL,
+	main_page_number int4 NULL,
+	bsr_page_number int4 NULL,
+	promotion_position int4 NULL,
+	CONSTRAINT bby_tv_product_list_pkey PRIMARY KEY (id)
+);
+CREATE INDEX idx_bby_tv_crawl ON public.bby_tv_product_list USING btree (crawl_datetime);
+CREATE INDEX idx_bby_tv_page_type ON public.bby_tv_product_list USING btree (page_type);
+CREATE INDEX idx_bby_tv_product_url ON public.bby_tv_product_list USING btree (product_url);
+
+
+-- public.bby_hhp_product_list definition
+
+-- Drop table
+
+-- DROP TABLE public.bby_hhp_product_list;
+
+CREATE TABLE public.bby_hhp_product_list (
+	id serial4 NOT NULL,
+	account_name varchar(50) NOT NULL,
+	page_type varchar(50) NOT NULL,
+	retailer_sku_name text NULL,
+	final_sku_price varchar(50) NULL,
+	savings varchar(50) NULL,
+	comparable_pricing varchar(100) NULL,
+	offer varchar(100) NULL,
+	pick_up_availability varchar(100) NULL,
+	fastest_delivery varchar(100) NULL,
+	delivery_availability varchar(100) NULL,
+	sku_status varchar(100) NULL,
+	promotion_type varchar(100) NULL,
+	trend_rank int4 NULL,
+	main_rank int4 NULL,
+	bsr_rank int4 NULL,
+	product_url text NULL,
+	calendar_week varchar(10) NULL,
+	crawl_strdatetime varchar(50) NULL,
+	batch_id varchar(50) NULL,
+	main_page_number int4 NULL,
+	bsr_page_number int4 NULL,
+	CONSTRAINT bby_hhp_product_list_pkey PRIMARY KEY (id)
+);
+CREATE INDEX idx_bby_crawl ON public.bby_hhp_product_list USING btree (crawl_strdatetime);
+CREATE INDEX idx_bby_page_type ON public.bby_hhp_product_list USING btree (page_type);
+CREATE INDEX idx_bby_product_url ON public.bby_hhp_product_list USING btree (product_url);

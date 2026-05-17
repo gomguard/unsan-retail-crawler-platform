@@ -1,0 +1,9 @@
+corp,product_line,account_name,orchestrator_module,default_pages,detail_limit,page_workers,detail_workers,is_active,notes
+SEA,TV,Bestbuy,bestbuy.bestbuy_orchestrator,13,0,3,3,true,BestBuy TV standard run
+SEA,HHP,Bestbuy,bestbuy.bestbuy_orchestrator,13,0,3,3,true,BestBuy HHP standard run
+SEA,REF,Bestbuy,bestbuy.bestbuy_orchestrator,13,0,3,3,true,BestBuy REF standard run
+SEA,LDY,Bestbuy,bestbuy.bestbuy_orchestrator,13,0,3,3,true,BestBuy LDY standard run
+SEA,REF,Lowes,lowes.lowes_orchestrator,13,0,1,3,true,Lowe's REF standard run
+SEA,LDY,Lowes,lowes.lowes_orchestrator,13,0,1,3,true,Lowe's LDY standard run
+SEA,TV,Amazon,amazon.amazon_orchestrator,13,0,1,3,true,Amazon TV standard run
+SEA,HHP,Amazon,amazon.amazon_orchestrator,13,0,1,3,true,Amazon HHP standard run

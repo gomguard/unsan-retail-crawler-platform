@@ -1,0 +1,15 @@
+corp,product_line,account_name,output_kind,schema_name,table_name,csv_name,loader_module,is_active,notes
+SEA,TV,Bestbuy,final,public,tmp_bestbuy_tv_final_output_20260517,final_output.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy TV final output
+SEA,TV,Bestbuy,product_list,public,tmp_bestbuy_tv_product_list_20260517,bestbuy_product_list.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy TV listing output
+SEA,HHP,Bestbuy,final,public,tmp_bestbuy_hhp_final_output_20260517,final_output.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy HHP final output
+SEA,HHP,Bestbuy,product_list,public,tmp_bestbuy_hhp_product_list_20260517,bestbuy_product_list.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy HHP listing output
+SEA,REF,Bestbuy,final,public,tmp_bestbuy_ref_final_output_20260517,final_output.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy REF final output
+SEA,REF,Bestbuy,product_list,public,tmp_bestbuy_ref_product_list_20260517,bestbuy_product_list.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy REF listing output
+SEA,LDY,Bestbuy,final,public,tmp_bestbuy_ldy_final_output_20260517,final_output.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy LDY final output
+SEA,LDY,Bestbuy,product_list,public,tmp_bestbuy_ldy_product_list_20260517,bestbuy_product_list.csv,bestbuy.step14_db_load,true,TEST ONLY - BestBuy LDY listing output
+SEA,REF,Lowes,final,public,tmp_lowes_ref_final_output_20260517,final_output.csv,lowes.step14_db_load,true,TEST ONLY - Lowe's REF final output
+SEA,LDY,Lowes,final,public,tmp_lowes_ldy_final_output_20260517,final_output.csv,lowes.step14_db_load,true,TEST ONLY - Lowe's LDY final output
+SEA,TV,Amazon,final,public,tmp_amazon_tv_final_output_20260517,final_output.csv,amazon.step14_db_load,true,TEST ONLY - Amazon TV final output
+SEA,HHP,Amazon,final,public,tmp_amazon_hhp_final_output_20260517,final_output.csv,amazon.step14_db_load,true,TEST ONLY - Amazon HHP final output
+SEA,TV,Walmart,final,public,tmp_walmart_tv_final_output_20260517,final_output.csv,walmart.step14_db_load,false,TEST ONLY - planned Walmart TV final output
+SEA,HHP,Walmart,final,public,tmp_walmart_hhp_final_output_20260517,final_output.csv,walmart.step14_db_load,false,TEST ONLY - planned Walmart HHP final output

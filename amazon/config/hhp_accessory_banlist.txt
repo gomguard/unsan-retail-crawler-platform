@@ -1,0 +1,6 @@
+# One case-insensitive regex per line.
+# These patterns are for excluding clear HHP accessories after a product name is known.
+\bcase\s+for\b
+\bfor\s+(iphone|samsung|galaxy|pixel|moto|motorola|oneplus)[^,;]{0,80}\bcase\b
+\b(phone|cell phone|cellphone)\s+(case|stand|mount|holder|holders|lanyard|tether|strap|tripod|purse|bag|sanitizer|sleeve|grip|chain|charm|locker|caddy|cabinet)\b
+\b(wallet case|screen protector|tempered glass|card holder|selfie stick|faraday bag|earbuds|earpiece|headset|headphones|charging station|watch band|car mount|motorcycle mount)\b
