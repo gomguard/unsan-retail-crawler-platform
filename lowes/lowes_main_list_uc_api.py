@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import csv
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode
@@ -41,10 +42,17 @@ USER_DATA_DIR = os.getenv("LOWES_UC_USER_DATA_DIR", "").strip()
 PROFILE_DIR = os.getenv("LOWES_UC_PROFILE_DIR", "").strip()
 SET_STORE_COOKIES = os.getenv("LOWES_SET_STORE_COOKIES", "1").strip().lower() not in {"0", "false", "no"}
 API_EXTRA_QUERY = os.getenv("LOWES_API_EXTRA_QUERY", "").strip()
+STOP_AT_PAGE_COUNT = os.getenv("LOWES_UC_STOP_AT_PAGE_COUNT", "1").strip().lower() not in {"0", "false", "no"}
+BENCHMARK_ROOT = Path(os.getenv("LOWES_MAIN_BENCHMARK_ROOT", str(RUN_ROOT / "benchmarks")))
+MAIN_PROGRESS_CSV = Path(os.getenv("LOWES_MAIN_PROGRESS_CSV", str(BENCHMARK_ROOT / "main_fetch_progress.csv")))
+MAIN_PROGRESS_JSON = Path(os.getenv("LOWES_MAIN_PROGRESS_JSON", str(BENCHMARK_ROOT / "main_fetch_progress.json")))
+MAIN_BENCHMARK_SUMMARY_JSON = Path(
+    os.getenv("LOWES_MAIN_BENCHMARK_SUMMARY_JSON", str(BENCHMARK_ROOT / "main_fetch_summary.json"))
+)
 
 
 def make_dirs():
-    for subdir in ["raw/main_pages", "parsed", "logs"]:
+    for subdir in ["raw/main_pages", "parsed", "logs", "benchmarks"]:
         (RUN_ROOT / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -107,6 +115,45 @@ def save_attempt(result):
     return meta
 
 
+MAIN_BENCHMARK_FIELDS = [
+    "completed",
+    "total_requested",
+    "remaining_requested",
+    "page",
+    "offset",
+    "status_code",
+    "elapsed_seconds",
+    "bytes",
+    "item_count",
+    "product_count",
+    "pagination_page_count",
+    "adjusted_next_offset",
+    "rate_per_minute",
+    "eta_seconds",
+    "started_at",
+    "finished_at",
+    "url",
+    "error",
+]
+
+
+def reset_main_benchmark_csv(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        csv.DictWriter(f, fieldnames=MAIN_BENCHMARK_FIELDS, extrasaction="ignore").writeheader()
+
+
+def append_main_benchmark(path, row):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        csv.DictWriter(f, fieldnames=MAIN_BENCHMARK_FIELDS, extrasaction="ignore").writerow(row)
+
+
+def write_benchmark_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def summarize_json(result):
     try:
         payload = json.loads(result.get("text", ""))
@@ -164,7 +211,17 @@ def fetch_api(driver, url):
 def collect_pages(driver, tasks, logger):
     results = []
     adjusted_next_offset = None
+    last_page_count = None
+    reset_main_benchmark_csv(MAIN_PROGRESS_CSV)
+    run_started = time.time()
+    run_started_at = datetime.now().isoformat(timespec="seconds")
+    completed = 0
+    success_count = 0
+    failure_count = 0
     for page_number, offset in tasks:
+        if STOP_AT_PAGE_COUNT and last_page_count and page_number > last_page_count:
+            logger.write(f"STOP  uc-api page={page_number:03d}: page_count={last_page_count}")
+            break
         url = build_api_url(offset, adjusted_next_offset)
         logger.write(
             f"START uc-api page={page_number:03d} offset={offset} "
@@ -195,9 +252,60 @@ def collect_pages(driver, tasks, logger):
         }
         if result["status_code"] == 200:
             summarize_json(result)
+            page_count = result.get("pagination_page_count")
+            if page_count not in (None, ""):
+                try:
+                    last_page_count = int(page_count)
+                except (TypeError, ValueError):
+                    pass
         meta = save_attempt(result)
         result["attempts"] = [meta]
         results.append(result)
+        completed += 1
+        success_count += 1 if result["status_code"] == 200 else 0
+        failure_count += 0 if result["status_code"] == 200 else 1
+        wall_elapsed = max(time.time() - run_started, 0.001)
+        rate_per_minute = round(completed / wall_elapsed * 60, 3)
+        remaining = max(len(tasks) - completed, 0)
+        eta_seconds = round(remaining / (completed / wall_elapsed), 1) if completed else ""
+        benchmark_row = {
+            "completed": completed,
+            "total_requested": len(tasks),
+            "remaining_requested": remaining,
+            "page": page_number,
+            "offset": offset,
+            "status_code": result["status_code"],
+            "elapsed_seconds": elapsed,
+            "bytes": len(result.get("text", "")),
+            "item_count": result.get("item_count", 0),
+            "product_count": result.get("product_count", ""),
+            "pagination_page_count": result.get("pagination_page_count", ""),
+            "adjusted_next_offset": result.get("adjusted_next_offset", ""),
+            "rate_per_minute": rate_per_minute,
+            "eta_seconds": eta_seconds,
+            "started_at": result.get("started_at", ""),
+            "finished_at": result.get("finished_at", ""),
+            "url": url,
+            "error": result.get("error", ""),
+        }
+        append_main_benchmark(MAIN_PROGRESS_CSV, benchmark_row)
+        write_benchmark_json(
+            MAIN_PROGRESS_JSON,
+            {
+                "run_started_at": run_started_at,
+                "last_updated_at": datetime.now().isoformat(timespec="seconds"),
+                "search_term": SEARCH_TERM,
+                "total_requested": len(tasks),
+                "completed": completed,
+                "remaining_requested": remaining,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "rate_per_minute": rate_per_minute,
+                "eta_seconds": eta_seconds,
+                "last_page_count": last_page_count,
+                "last_item": benchmark_row,
+            },
+        )
         logger.write(
             f"DONE  uc-api page={page_number:03d} status={result['status_code'] or 'ERR'} "
             f"elapsed={elapsed}s bytes={len(result.get('text', ''))} "
@@ -338,6 +446,30 @@ def main():
     }
     manifest_path = RUN_ROOT / "manifest.json"
     write_manifest(manifest_path, manifest)
+    write_benchmark_json(
+        MAIN_BENCHMARK_SUMMARY_JSON,
+        {
+            "success": True,
+            "run_type": "step01_main_list_uc_api",
+            "run_root": str(RUN_ROOT),
+            "run_started_at": run_started_at,
+            "run_finished_at": manifest["run_finished_at"],
+            "elapsed_seconds": manifest["elapsed_seconds"],
+            "search_term": SEARCH_TERM,
+            "pages_requested": len(tasks),
+            "pages_fetched": len(fetch_results),
+            "rows": len(rows),
+            "unique_omni_item_id": len(seen_ids),
+            "successful_http_pages": manifest["successful_http_pages"],
+            "valid_item_pages": manifest["valid_item_pages"],
+            "failed_pages": manifest["failed_pages"],
+            "progress_csv": str(MAIN_PROGRESS_CSV),
+            "progress_json": str(MAIN_PROGRESS_JSON),
+            "main_occurrences": str(csv_path),
+            "main_page_summary": str(page_summary_path),
+            "manifest": str(manifest_path),
+        },
+    )
 
     logger.write("-" * 80)
     logger.write(
@@ -347,6 +479,7 @@ def main():
     logger.write(f"CSV={csv_path}")
     logger.write(f"PAGE_SUMMARY={page_summary_path}")
     logger.write(f"MANIFEST={manifest_path}")
+    logger.write(f"BENCHMARK={MAIN_BENCHMARK_SUMMARY_JSON}")
 
 
 if __name__ == "__main__":

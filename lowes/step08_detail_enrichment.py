@@ -35,11 +35,26 @@ DETAIL_CSV = Path(os.getenv("LOWES_DETAIL_CSV", str(DETAIL_ROOT / "parsed" / "de
 DETAIL_FAILURES_CSV = Path(os.getenv("LOWES_DETAIL_FAILURES_CSV", str(DETAIL_ROOT / "parsed" / "detail_failures.csv")))
 ENRICHED_CSV = Path(os.getenv("LOWES_FINAL_OUTPUT_CSV", os.getenv("LOWES_ENRICHED_CSV", str(OUTPUT_ROOT / "final_output.csv"))))
 OVERRIDES_CSV = Path(os.getenv("LOWES_PRICE_OVERRIDES_CSV", str(OUTPUT_ROOT / "lowes_price_overrides.csv")))
+BENCHMARK_ROOT = Path(os.getenv("LOWES_DETAIL_BENCHMARK_ROOT", str(DETAIL_ROOT / "benchmarks")))
+DETAIL_PROGRESS_CSV = Path(
+    os.getenv("LOWES_DETAIL_PROGRESS_CSV", str(BENCHMARK_ROOT / "detail_fetch_progress.csv"))
+)
+DETAIL_PROGRESS_JSON = Path(
+    os.getenv("LOWES_DETAIL_PROGRESS_JSON", str(BENCHMARK_ROOT / "detail_fetch_progress.json"))
+)
+DETAIL_BENCHMARK_SUMMARY_JSON = Path(
+    os.getenv("LOWES_DETAIL_BENCHMARK_SUMMARY_JSON", str(BENCHMARK_ROOT / "detail_fetch_summary.json"))
+)
 REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "180"))
 MAX_WORKERS = int(os.getenv("LOWES_DETAIL_WORKERS", "3"))
 DETAIL_LIMIT = int(os.getenv("LOWES_DETAIL_LIMIT", "0"))
 REFRESH = os.getenv("LOWES_REFRESH_DETAILS", "0") == "1"
 DETAIL_TARGET_MODE = os.getenv("LOWES_DETAIL_TARGET_MODE", "missing_price").strip().lower()
+DETAIL_TRANSPORT = os.getenv("LOWES_DETAIL_TRANSPORT", "zenrows").strip().lower()
+DETAIL_FALLBACK_ZENROWS = os.getenv("LOWES_DETAIL_FALLBACK_ZENROWS", "1").strip().lower() not in {"0", "false", "no"}
+UC_HEADLESS = os.getenv("LOWES_UC_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}
+UC_WAIT_SECONDS = float(os.getenv("LOWES_DETAIL_UC_WAIT_SECONDS", "4"))
+UC_PAGE_LOAD_TIMEOUT = int(os.getenv("LOWES_DETAIL_UC_PAGE_LOAD_TIMEOUT", "75"))
 REFETCH_IDS = {
     item.strip()
     for item in os.getenv("LOWES_DETAIL_REFETCH_IDS", "").split(",")
@@ -264,7 +279,47 @@ def detail_artifact_paths(product_id, rank):
     }
 
 
-def fetch_detail(task):
+def load_json(path):
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def cached_detail_meta(product_id, url, rank, success, html_path, headers_path, error=""):
+    paths = detail_artifact_paths(product_id, rank)
+    meta_path = paths["meta_success_path"] if success else paths["meta_fail_path"]
+    if not meta_path.exists():
+        meta_path = paths["legacy_meta_path"]
+    meta = load_json(meta_path)
+    if meta:
+        meta["from_cache"] = True
+        return meta
+    try:
+        byte_count = html_path.stat().st_size
+    except OSError:
+        byte_count = 0
+    return {
+        "sku_id": product_id,
+        "url": url,
+        "stage": "detail",
+        "attempt": 0,
+        "status_code": 200 if success else "",
+        "success": success,
+        "elapsed_seconds": 0,
+        "x_request_cost": "",
+        "error": error,
+        "bytes": byte_count,
+        "started_at": "",
+        "finished_at": "",
+        "from_cache": True,
+        "headers_path": str(headers_path),
+    }
+
+
+def cached_detail_result(task):
     product_id, url, rank = task
     DETAIL_DIR.mkdir(parents=True, exist_ok=True)
     paths = detail_artifact_paths(product_id, rank)
@@ -276,22 +331,42 @@ def fetch_detail(task):
     refetch = REFRESH or product_id in REFETCH_IDS
 
     if html_path.exists() and not refetch:
-        return product_id, "cached", html_path, headers_path, ""
+        meta = cached_detail_meta(product_id, url, rank, True, html_path, headers_path)
+        return product_id, "cached", html_path, headers_path, "", meta
     if paths["legacy_html_path"].exists() and not refetch:
-        return product_id, "cached", paths["legacy_html_path"], paths["legacy_headers_path"], ""
+        meta = cached_detail_meta(product_id, url, rank, True, paths["legacy_html_path"], paths["legacy_headers_path"])
+        return product_id, "cached", paths["legacy_html_path"], paths["legacy_headers_path"], "", meta
     if failed_path.exists() and not refetch:
-        return product_id, "cached_failed", failed_path, headers_path, failed_path.read_text(
+        error = failed_path.read_text(
             encoding="utf-8",
             errors="replace",
         )[:500]
+        meta = cached_detail_meta(product_id, url, rank, False, failed_path, headers_path, error)
+        return product_id, "cached_failed", failed_path, headers_path, error, meta
     if paths["legacy_failed_path"].exists() and not refetch:
-        return product_id, "cached_failed", paths["legacy_failed_path"], paths["legacy_headers_path"], paths[
-            "legacy_failed_path"
-        ].read_text(
+        error = paths["legacy_failed_path"].read_text(
             encoding="utf-8",
             errors="replace",
         )[:500]
+        meta = cached_detail_meta(product_id, url, rank, False, paths["legacy_failed_path"], paths["legacy_headers_path"], error)
+        return product_id, "cached_failed", paths["legacy_failed_path"], paths["legacy_headers_path"], error, meta
+    return None
 
+
+def fetch_detail(task):
+    cached = cached_detail_result(task)
+    if cached:
+        return cached
+    return fetch_detail_zenrows(task)
+
+
+def fetch_detail_zenrows(task):
+    product_id, url, rank = task
+    DETAIL_DIR.mkdir(parents=True, exist_ok=True)
+    paths = detail_artifact_paths(product_id, rank)
+    html_path = paths["html_path"]
+    failed_path = paths["failed_path"]
+    headers_path = paths["headers_success_path"]
     client = ZenRowsClient(os.environ["ZENROWS_API_KEY"])
     params = {"mode": "auto", "proxy_country": "us"}
     start = time.time()
@@ -301,28 +376,26 @@ def fetch_detail(task):
     except RequestException as exc:
         paths["fail_dir"].mkdir(parents=True, exist_ok=True)
         meta_path = paths["meta_fail_path"]
+        meta = {
+            "sku_id": product_id,
+            "url": url,
+            "stage": "detail",
+            "attempt": 1,
+            "status_code": "",
+            "success": False,
+            "elapsed_seconds": round(time.time() - start, 3),
+            "x_request_cost": "",
+            "error": str(exc),
+            "bytes": 0,
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "from_cache": False,
+        }
         meta_path.write_text(
-            json.dumps(
-                {
-                    "sku_id": product_id,
-                    "url": url,
-                    "stage": "detail",
-                    "attempt": 1,
-                    "status_code": "",
-                    "success": False,
-                    "elapsed_seconds": round(time.time() - start, 3),
-                    "x_request_cost": "",
-                    "error": str(exc),
-                    "bytes": 0,
-                    "started_at": started_at,
-                    "finished_at": datetime.now().isoformat(timespec="seconds"),
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
+            json.dumps(meta, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        return product_id, "exception", html_path, headers_path, str(exc)
+        return product_id, "exception", html_path, headers_path, str(exc), meta
 
     elapsed = time.time() - start
     if response.status_code == 200:
@@ -340,31 +413,105 @@ def fetch_detail(task):
         json.dumps(dict(response.headers), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    meta = {
+        "sku_id": product_id,
+        "url": url,
+        "stage": "detail",
+        "attempt": 1,
+        "status_code": response.status_code,
+        "success": response.status_code == 200,
+        "elapsed_seconds": round(elapsed, 3),
+        "x_request_cost": response.headers.get("x-request-cost", ""),
+        "error": "" if response.status_code == 200 else response.text[:500],
+        "bytes": len(response.text),
+        "started_at": started_at,
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "from_cache": False,
+    }
     meta_path.write_text(
-        json.dumps(
-            {
-                "sku_id": product_id,
-                "url": url,
-                "stage": "detail",
-                "attempt": 1,
-                "status_code": response.status_code,
-                "success": response.status_code == 200,
-                "elapsed_seconds": round(elapsed, 3),
-                "x_request_cost": response.headers.get("x-request-cost", ""),
-                "error": "" if response.status_code == 200 else response.text[:500],
-                "bytes": len(response.text),
-                "started_at": started_at,
-                "finished_at": datetime.now().isoformat(timespec="seconds"),
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
+        json.dumps(meta, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
     if response.status_code != 200:
-        return product_id, f"http_{response.status_code}", suffix_path, headers_path, response.text[:500]
-    return product_id, f"fetched_{elapsed:.1f}s", html_path, headers_path, ""
+        return product_id, f"http_{response.status_code}", suffix_path, headers_path, response.text[:500], meta
+    return product_id, f"fetched_{elapsed:.1f}s", html_path, headers_path, "", meta
+
+
+def write_uc_detail_failure(product_id, url, rank, error, started_at, start):
+    paths = detail_artifact_paths(product_id, rank)
+    paths["fail_dir"].mkdir(parents=True, exist_ok=True)
+    failed_path = paths["failed_path"]
+    headers_path = paths["headers_fail_path"]
+    meta_path = paths["meta_fail_path"]
+    failed_path.write_text(error, encoding="utf-8", errors="replace")
+    headers_path.write_text(json.dumps({"transport": "uc"}, indent=2, ensure_ascii=False), encoding="utf-8")
+    meta = {
+        "sku_id": product_id,
+        "url": url,
+        "stage": "detail",
+        "attempt": 1,
+        "status_code": "",
+        "success": False,
+        "transport": "uc",
+        "elapsed_seconds": round(time.time() - start, 3),
+        "x_request_cost": "0",
+        "error": error,
+        "bytes": 0,
+        "started_at": started_at,
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "from_cache": False,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return product_id, "uc_exception", failed_path, headers_path, error, meta
+
+
+def fetch_detail_uc(driver, task):
+    product_id, url, rank = task
+    cached = cached_detail_result(task)
+    if cached:
+        return cached
+    DETAIL_DIR.mkdir(parents=True, exist_ok=True)
+    paths = detail_artifact_paths(product_id, rank)
+    html_path = paths["html_path"]
+    headers_path = paths["headers_success_path"]
+    started_at = datetime.now().isoformat(timespec="seconds")
+    start = time.time()
+    try:
+        driver.get(url)
+        time.sleep(UC_WAIT_SECONDS)
+        page_html = driver.page_source or ""
+    except Exception as exc:
+        return write_uc_detail_failure(product_id, url, rank, f"{type(exc).__name__}: {exc}", started_at, start)
+
+    elapsed = time.time() - start
+    success = bool(page_html and ("__PRELOADED_STATE__" in page_html or f"/{product_id}" in page_html))
+    if success:
+        paths["success_dir"].mkdir(parents=True, exist_ok=True)
+        html_path.write_text(page_html, encoding="utf-8", errors="replace")
+        headers_path.write_text(json.dumps({"transport": "uc"}, indent=2, ensure_ascii=False), encoding="utf-8")
+        meta_path = paths["meta_success_path"]
+        meta = {
+            "sku_id": product_id,
+            "url": url,
+            "stage": "detail",
+            "attempt": 1,
+            "status_code": 200,
+            "success": True,
+            "transport": "uc",
+            "elapsed_seconds": round(elapsed, 3),
+            "x_request_cost": "0",
+            "error": "",
+            "bytes": len(page_html),
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "from_cache": False,
+        }
+        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        return product_id, f"uc_fetched_{elapsed:.1f}s", html_path, headers_path, "", meta
+
+    error = "uc_empty_or_unparseable_page"
+    return write_uc_detail_failure(product_id, url, rank, error, started_at, start)
 
 
 def parse_detail(product_id, page_html):
@@ -530,6 +677,46 @@ def write_failure_csv(path, rows):
         writer.writerows(rows)
 
 
+DETAIL_BENCHMARK_FIELDS = [
+    "completed",
+    "total",
+    "remaining",
+    "sku_id",
+    "status",
+    "success",
+    "from_cache",
+    "status_code",
+    "elapsed_seconds",
+    "bytes",
+    "x_request_cost",
+    "rate_per_minute",
+    "eta_seconds",
+    "started_at",
+    "finished_at",
+    "html_path",
+    "headers_path",
+    "error",
+]
+
+
+def reset_detail_benchmark_csv(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        csv.DictWriter(f, fieldnames=DETAIL_BENCHMARK_FIELDS, extrasaction="ignore").writeheader()
+
+
+def append_detail_benchmark(path, row):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DETAIL_BENCHMARK_FIELDS, extrasaction="ignore")
+        writer.writerow(row)
+
+
+def write_detail_progress_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def load_overrides():
     if not OVERRIDES_CSV.exists():
         return {}
@@ -538,7 +725,8 @@ def load_overrides():
 
 
 def main():
-    if not os.getenv("ZENROWS_API_KEY"):
+    needs_zenrows = DETAIL_TRANSPORT in {"zenrows", "zenrows_first"} or DETAIL_FALLBACK_ZENROWS
+    if needs_zenrows and not os.getenv("ZENROWS_API_KEY"):
         raise RuntimeError("ZENROWS_API_KEY is missing. Put it in .env or environment.")
 
     rows = list(csv.DictReader(INPUT_CSV.open(encoding="utf-8-sig", newline="")))
@@ -565,24 +753,112 @@ def main():
     print(f"Detail target mode: {DETAIL_TARGET_MODE}")
     print(f"Detail target rows: {len(detail_targets)}")
     print(f"Unique detail pages to fetch/parse: {len(tasks)}")
+    print(f"Detail transport: {DETAIL_TRANSPORT} fallback_zenrows={DETAIL_FALLBACK_ZENROWS}")
     if REFETCH_IDS:
         print(f"Forced detail refetch IDs: {len(REFETCH_IDS)}")
+    print(f"Detail realtime benchmark CSV -> {DETAIL_PROGRESS_CSV}")
+    print(f"Detail realtime progress JSON -> {DETAIL_PROGRESS_JSON}")
 
     statuses = {}
-    with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS)) as executor:
-        futures = [
-            executor.submit(fetch_detail, (product_id, url_rank[0], url_rank[1]))
-            for product_id, url_rank in tasks.items()
-        ]
-        for future in as_completed(futures):
-            product_id, status, html_path, headers_path, error = future.result()
-            statuses[product_id] = {
-                "status": status,
-                "html_path": str(html_path),
-                "headers_path": str(headers_path),
-                "error": error,
-            }
-            print(f"  {product_id}: {status}")
+    reset_detail_benchmark_csv(DETAIL_PROGRESS_CSV)
+    run_started = time.time()
+    run_started_at = datetime.now().isoformat(timespec="seconds")
+    completed = 0
+    success_count = 0
+    failure_count = 0
+    cached_count = 0
+    def record_result(product_id, status, html_path, headers_path, error, meta):
+        nonlocal completed, success_count, failure_count, cached_count
+        statuses[product_id] = {
+            "status": status,
+            "html_path": str(html_path),
+            "headers_path": str(headers_path),
+            "error": error,
+            "meta": meta,
+        }
+        completed += 1
+        is_success = status in {"cached"} or status.startswith(("fetched_", "uc_fetched_"))
+        success_count += 1 if is_success else 0
+        failure_count += 0 if is_success else 1
+        cached_count += 1 if meta.get("from_cache") else 0
+        wall_elapsed = max(time.time() - run_started, 0.001)
+        rate_per_minute = round(completed / wall_elapsed * 60, 3)
+        remaining = max(len(tasks) - completed, 0)
+        eta_seconds = round(remaining / (completed / wall_elapsed), 1) if completed else ""
+        benchmark_row = {
+            "completed": completed,
+            "total": len(tasks),
+            "remaining": remaining,
+            "sku_id": product_id,
+            "status": status,
+            "success": is_success,
+            "from_cache": meta.get("from_cache", False),
+            "status_code": meta.get("status_code", ""),
+            "elapsed_seconds": meta.get("elapsed_seconds", ""),
+            "bytes": meta.get("bytes", ""),
+            "x_request_cost": meta.get("x_request_cost", ""),
+            "rate_per_minute": rate_per_minute,
+            "eta_seconds": eta_seconds,
+            "started_at": meta.get("started_at", ""),
+            "finished_at": meta.get("finished_at", datetime.now().isoformat(timespec="seconds")),
+            "html_path": str(html_path),
+            "headers_path": str(headers_path),
+            "error": error,
+        }
+        append_detail_benchmark(DETAIL_PROGRESS_CSV, benchmark_row)
+        progress_payload = {
+            "run_started_at": run_started_at,
+            "last_updated_at": datetime.now().isoformat(timespec="seconds"),
+            "input_csv": str(INPUT_CSV),
+            "detail_target_mode": DETAIL_TARGET_MODE,
+            "detail_transport": DETAIL_TRANSPORT,
+            "fallback_zenrows": DETAIL_FALLBACK_ZENROWS,
+            "workers": MAX_WORKERS,
+            "request_timeout_seconds": REQUEST_TIMEOUT,
+            "total": len(tasks),
+            "completed": completed,
+            "remaining": remaining,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "cached_count": cached_count,
+            "rate_per_minute": rate_per_minute,
+            "eta_seconds": eta_seconds,
+            "last_item": benchmark_row,
+        }
+        write_detail_progress_json(DETAIL_PROGRESS_JSON, progress_payload)
+        print(f"  {product_id}: {status} ({completed}/{len(tasks)}, eta={eta_seconds}s)")
+
+    if DETAIL_TRANSPORT in {"uc", "uc_first", "browser"}:
+        import undetected_chromedriver as uc
+
+        options = uc.ChromeOptions()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--start-maximized")
+        options.add_argument("--lang=en-US")
+        driver = uc.Chrome(options=options, headless=UC_HEADLESS, use_subprocess=True)
+        try:
+            driver.set_page_load_timeout(UC_PAGE_LOAD_TIMEOUT)
+            for product_id, url_rank in tasks.items():
+                result = fetch_detail_uc(driver, (product_id, url_rank[0], url_rank[1]))
+                if (
+                    DETAIL_TRANSPORT == "uc_first"
+                    and DETAIL_FALLBACK_ZENROWS
+                    and not (result[1] in {"cached"} or result[1].startswith("uc_fetched_"))
+                ):
+                    print(f"  {product_id}: UC failed; trying ZenRows fallback")
+                    result = fetch_detail_zenrows((product_id, url_rank[0], url_rank[1]))
+                record_result(*result)
+        finally:
+            driver.quit()
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS)) as executor:
+            futures = [
+                executor.submit(fetch_detail, (product_id, url_rank[0], url_rank[1]))
+                for product_id, url_rank in tasks.items()
+            ]
+            for future in as_completed(futures):
+                product_id, status, html_path, headers_path, error, meta = future.result()
+                record_result(product_id, status, html_path, headers_path, error, meta)
 
     detail_rows_by_id = {}
     failure_rows = []
@@ -715,12 +991,38 @@ def main():
     write_csv(ENRICHED_CSV, enriched_rows)
 
     resolved_count = sum(1 for row in detail_output_rows if row.get("resolved_selling_price"))
+    summary = {
+        "success": True,
+        "run_started_at": run_started_at,
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_seconds": round(time.time() - run_started, 3),
+        "input_csv": str(INPUT_CSV),
+        "detail_target_mode": DETAIL_TARGET_MODE,
+        "detail_transport": DETAIL_TRANSPORT,
+        "fallback_zenrows": DETAIL_FALLBACK_ZENROWS,
+        "workers": MAX_WORKERS,
+        "request_timeout_seconds": REQUEST_TIMEOUT,
+        "total_unique_detail_pages": len(tasks),
+        "fetch_success_count": success_count,
+        "fetch_failure_count": failure_count,
+        "cached_count": cached_count,
+        "detail_output_rows": len(detail_output_rows),
+        "detail_failure_rows": len(failure_rows),
+        "resolved_detail_prices": resolved_count,
+        "progress_csv": str(DETAIL_PROGRESS_CSV),
+        "progress_json": str(DETAIL_PROGRESS_JSON),
+        "detail_csv": str(DETAIL_CSV),
+        "failure_csv": str(DETAIL_FAILURES_CSV),
+        "enriched_csv": str(ENRICHED_CSV),
+    }
+    write_detail_progress_json(DETAIL_BENCHMARK_SUMMARY_JSON, summary)
     print("=" * 80)
     print(f"Detail rows saved -> {DETAIL_CSV} ({len(detail_output_rows)} rows)")
     print(f"Detail failures saved -> {DETAIL_FAILURES_CSV} ({len(failure_rows)} rows)")
     print(f"Enriched full CSV saved -> {ENRICHED_CSV} ({len(enriched_rows)} rows)")
     print(f"Resolved detail prices -> {resolved_count}/{len(detail_output_rows)}")
     print(f"Detail HTML cache -> {DETAIL_DIR}")
+    print(f"Detail benchmark summary -> {DETAIL_BENCHMARK_SUMMARY_JSON}")
 
 
 if __name__ == "__main__":

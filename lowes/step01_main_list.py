@@ -36,6 +36,8 @@ REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "600"))
 MAX_ATTEMPTS = int(os.getenv("LOWES_MAX_ATTEMPTS", "2"))
 RETRY_SLEEP_SECONDS = int(os.getenv("LOWES_RETRY_SLEEP_SECONDS", "10"))
 MAIN_SOURCE = os.getenv("LOWES_MAIN_SOURCE", "html").strip().lower()
+LOCAL_HTML_PATH = os.getenv("LOWES_MAIN_LOCAL_HTML", "").strip()
+LOCAL_STATE_JSON_PATH = os.getenv("LOWES_MAIN_LOCAL_STATE_JSON", "").strip()
 REQUEST_VARIANT = os.getenv("LOWES_REQUEST_VARIANT", "auto").strip().lower()
 BLOCK_RESOURCES = os.getenv("LOWES_BLOCK_RESOURCES", "image,media,font,stylesheet").strip()
 ANTIBOT = os.getenv("LOWES_ZENROWS_ANTIBOT", "true").strip().lower()
@@ -638,6 +640,88 @@ def fetch_api_pages(tasks, logger):
     return results
 
 
+def fetch_local_html_pages(tasks, logger):
+    if not LOCAL_HTML_PATH:
+        raise ValueError("LOWES_MAIN_LOCAL_HTML is required when LOWES_MAIN_SOURCE='local_html'")
+    html_path = Path(LOCAL_HTML_PATH)
+    html = html_path.read_text(encoding="utf-8", errors="replace")
+    results = []
+    for page_number, offset in tasks:
+        logger.write(f"LOCAL page={page_number:03d} offset={offset} html={html_path}")
+        results.append(
+            {
+                "page": page_number,
+                "offset": offset,
+                "url": build_url(offset),
+                "attempt": 1,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_seconds": 0,
+                "status_code": 200,
+                "headers": {},
+                "text": html,
+                "content_kind": "html",
+                "error": "",
+                "source_path": str(html_path),
+                "attempts": [
+                    {
+                        "page": page_number,
+                        "offset": offset,
+                        "url": build_url(offset),
+                        "attempt": 1,
+                        "status_code": 200,
+                        "elapsed_seconds": 0,
+                        "bytes": len(html),
+                        "body_path": str(html_path),
+                        "headers_brief": {},
+                    }
+                ],
+            }
+        )
+    return results
+
+
+def fetch_local_state_json_pages(tasks, logger):
+    if not LOCAL_STATE_JSON_PATH:
+        raise ValueError("LOWES_MAIN_LOCAL_STATE_JSON is required when LOWES_MAIN_SOURCE='local_state_json'")
+    state_path = Path(LOCAL_STATE_JSON_PATH)
+    text = state_path.read_text(encoding="utf-8", errors="replace")
+    results = []
+    for page_number, offset in tasks:
+        logger.write(f"LOCAL_STATE page={page_number:03d} offset={offset} json={state_path}")
+        results.append(
+            {
+                "page": page_number,
+                "offset": offset,
+                "url": build_url(offset),
+                "attempt": 1,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_seconds": 0,
+                "status_code": 200,
+                "headers": {},
+                "text": text,
+                "content_kind": "json",
+                "error": "",
+                "source_path": str(state_path),
+                "attempts": [
+                    {
+                        "page": page_number,
+                        "offset": offset,
+                        "url": build_url(offset),
+                        "attempt": 1,
+                        "status_code": 200,
+                        "elapsed_seconds": 0,
+                        "bytes": len(text),
+                        "body_path": str(state_path),
+                        "headers_brief": {},
+                    }
+                ],
+            }
+        )
+    return results
+
+
 def write_csv(path, rows):
     preferred = [
         "page",
@@ -828,8 +912,12 @@ def main():
             for future in as_completed(future_map):
                 result = future.result()
                 fetch_results.append(result)
+    elif MAIN_SOURCE == "local_html":
+        fetch_results = fetch_local_html_pages(tasks, logger)
+    elif MAIN_SOURCE == "local_state_json":
+        fetch_results = fetch_local_state_json_pages(tasks, logger)
     else:
-        raise ValueError("LOWES_MAIN_SOURCE must be 'html' or 'api'")
+        raise ValueError("LOWES_MAIN_SOURCE must be 'html', 'api', 'local_html', or 'local_state_json'")
 
     rows, raw_pages, seen_ids = parse_pages(fetch_results, logger)
     parsed_dir = RUN_ROOT / "parsed"
@@ -850,6 +938,8 @@ def main():
         "elapsed_seconds": round(elapsed, 3),
         "search_term": SEARCH_TERM,
         "main_source": MAIN_SOURCE,
+        "local_html_path": LOCAL_HTML_PATH if MAIN_SOURCE == "local_html" else "",
+        "local_state_json_path": LOCAL_STATE_JSON_PATH if MAIN_SOURCE == "local_state_json" else "",
         "api_transport": API_TRANSPORT if MAIN_SOURCE == "api" else "",
         "api_store": {
             "store_id": API_STORE_ID,

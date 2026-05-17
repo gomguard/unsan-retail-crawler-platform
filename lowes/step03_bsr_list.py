@@ -37,6 +37,11 @@ RUN_ROOT = Path(os.getenv("LOWES_RUN_ROOT", str(DEFAULT_LOWES_RUN_ROOT))) / RUN_
 OUT_DIR = Path(os.getenv("LOWES_BSR_OUT_DIR", str(RUN_ROOT / "raw" / "main_pages")))
 CSV_PATH = Path(os.getenv("LOWES_BSR_CSV", str(RUN_ROOT / "parsed" / "main_occurrences.csv")))
 TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "180"))
+BSR_TRANSPORT = os.getenv("LOWES_BSR_TRANSPORT", "zenrows").strip().lower()
+BSR_FALLBACK_ZENROWS = os.getenv("LOWES_BSR_FALLBACK_ZENROWS", "1").strip().lower() not in {"0", "false", "no"}
+UC_HEADLESS = os.getenv("LOWES_UC_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}
+UC_WAIT_SECONDS = float(os.getenv("LOWES_BSR_UC_WAIT_SECONDS", "5"))
+UC_PAGE_LOAD_TIMEOUT = int(os.getenv("LOWES_BSR_UC_PAGE_LOAD_TIMEOUT", "60"))
 
 
 def now():
@@ -118,6 +123,71 @@ def parse_bsr_state_product(item, rank, bsr_rank):
 
 
 def fetch_bsr():
+    if BSR_TRANSPORT in {"uc", "uc_first", "browser"}:
+        try:
+            return fetch_bsr_uc()
+        except Exception as exc:
+            if not BSR_FALLBACK_ZENROWS:
+                raise
+            print(f"[Lowes BSR] UC failed; falling back to ZenRows: {type(exc).__name__}: {exc}")
+    return fetch_bsr_zenrows()
+
+
+def fetch_bsr_uc():
+    import undetected_chromedriver as uc
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[Lowes BSR] {PRODUCT_GROUP} UC GET {BSR_URL}")
+    started_at = now()
+    start = time.time()
+    options = uc.ChromeOptions()
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--start-maximized")
+    options.add_argument("--lang=en-US")
+    driver = uc.Chrome(options=options, headless=UC_HEADLESS, use_subprocess=True)
+    try:
+        driver.set_page_load_timeout(UC_PAGE_LOAD_TIMEOUT)
+        driver.get(BSR_URL)
+        time.sleep(UC_WAIT_SECONDS)
+        body = driver.page_source or ""
+    finally:
+        driver.quit()
+    elapsed = time.time() - start
+    success = bool(body and ("__PRELOADED_STATE__" in body or "/pd/" in body))
+    status_name = "success" if success else "fail"
+    body_path, headers_path, meta_path = write_raw_artifacts(
+        status_name=status_name,
+        body=body,
+        headers={"transport": "uc"},
+        meta={
+            "status_code": 200 if success else "",
+            "success": success,
+            "attempt": 1,
+            "transport": "uc",
+            "elapsed_seconds": round(elapsed, 3),
+            "x_request_cost": "0",
+            "error": "" if success else "uc_empty_or_unparseable_page",
+            "bytes": len(body),
+            "started_at": started_at,
+            "finished_at": now(),
+        },
+    )
+    print(f"transport=uc status={'200' if success else 'ERR'} elapsed={elapsed:.1f}s bytes={len(body)}")
+    print(f"html={body_path}")
+    print(f"headers={headers_path}")
+    print(f"meta={meta_path}")
+    if not success:
+        raise RuntimeError("UC BSR fetch did not return a parseable page")
+
+    class LocalResponse:
+        status_code = 200
+        text = body
+        headers = {"transport": "uc", "x-request-cost": "0"}
+
+    return LocalResponse()
+
+
+def fetch_bsr_zenrows():
     api_key = os.getenv("ZENROWS_API_KEY")
     if not api_key:
         raise RuntimeError("Set ZENROWS_API_KEY in .env")

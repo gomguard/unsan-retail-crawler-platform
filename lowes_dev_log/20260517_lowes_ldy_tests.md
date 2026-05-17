@@ -47,6 +47,39 @@ custom_headers=true for HTML mode
 
 ## Test Timeline
 
+### 15:44:44 - Cost-first crawl strategy documented
+
+Context:
+
+- User requested future Amazon, Best Buy, Lowe's, and other crawler work to keep
+  at least two approaches available.
+- Cost concern: avoid ZenRows until direct or lower-cost collection paths have
+  been tested.
+
+Policy added:
+
+- `AGENTS.md`
+- `CRAWLER_OPERATION_POLICY.md`
+
+Default future approach:
+
+1. Try low-cost/direct path first:
+   - official API or public JSON/GraphQL
+   - direct `requests`/curl with stable headers
+   - browser/session exported curl
+   - copied browser state JSON
+   - Playwright without paid proxy
+2. Use ZenRows only as fallback:
+   - start with cheapest useful mode
+   - escalate to `js_render`, `antibot`, `premium_proxy`, and long waits only
+     after cheaper attempts fail
+
+Required logging:
+
+- Record direct attempt and ZenRows fallback separately.
+- Include request counts, retry counts, timeout, proxy/render flags, status,
+  elapsed time, raw artifact paths, and interpretation.
+
 ### 15:20 - Development logging policy added
 
 Context:
@@ -348,6 +381,120 @@ python -m py_compile lowes\step01_main_list.py lowes\lowes_orchestrator.py lowes
 
 Result: passed.
 
+## Lowe's Cost Policy: UC First, ZenRows Fallback
+
+Decision:
+
+- ZenRows has direct API cost.
+- UC/browser collection does not add ZenRows call cost.
+- For Lowe's, use UC first wherever practical and keep ZenRows as fallback only.
+
+Code changes:
+
+- `lowes/lowes_orchestrator.py`
+  - Default `LOWES_MAIN_LIST_MODULE=lowes.lowes_main_list_uc_api` for Lowe's categories.
+  - Default `LOWES_BSR_TRANSPORT=uc_first`.
+  - Default `LOWES_BSR_FALLBACK_ZENROWS=1`.
+  - Default `LOWES_DETAIL_TRANSPORT=uc_first`.
+  - Default `LOWES_DETAIL_FALLBACK_ZENROWS=1`.
+
+- `lowes/step03_bsr_list.py`
+  - Added UC BSR fetch mode.
+  - `LOWES_BSR_TRANSPORT=uc_first` tries UC first.
+  - If UC fails and fallback is enabled, ZenRows is used as paid fallback.
+  - UC artifacts mark `transport=uc` and `x_request_cost=0`.
+
+- `lowes/step08_detail_enrichment.py`
+  - Added UC detail fetch mode.
+  - `LOWES_DETAIL_TRANSPORT=uc_first` fetches PDP pages with UC first.
+  - Failed UC detail fetches can fall back to ZenRows when `LOWES_DETAIL_FALLBACK_ZENROWS=1`.
+  - Detail benchmark JSON now records `detail_transport` and `fallback_zenrows`.
+  - UC artifacts mark `transport=uc` and `x_request_cost=0`.
+
+Next tests:
+
+1. LDY failed detail IDs with UC-first:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'
+$env:LOWES_DETAIL_TRANSPORT='uc_first'
+$env:LOWES_DETAIL_FALLBACK_ZENROWS='1'
+$env:LOWES_DETAIL_REFETCH_IDS='5013548885,1000704380,5014906275,5016333377,5014349161,5017781001,5017759985,5017970755'
+python -m lowes.lowes_orchestrator --product-type LDY 08 10
+```
+
+2. REF UC-first detail sample:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='REF'
+$env:LOWES_DETAIL_TRANSPORT='uc_first'
+$env:LOWES_DETAIL_FALLBACK_ZENROWS='1'
+$env:LOWES_DETAIL_TARGET_MODE='all'
+$env:LOWES_DETAIL_LIMIT='50'
+python -m lowes.lowes_orchestrator --product-type REF 08 10
+```
+
+3. BSR UC-first comparison:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'
+$env:LOWES_BSR_TRANSPORT='uc_first'
+python -m lowes.lowes_orchestrator --product-type LDY 03 04
+```
+
+Verification:
+
+```powershell
+python -m py_compile lowes\lowes_orchestrator.py lowes\step03_bsr_list.py lowes\step08_detail_enrichment.py
+$env:LOWES_PRODUCT_TYPE='LDY'; python -m lowes.lowes_orchestrator --product-type LDY --dry-run 01 03 08
+```
+
+Result: passed. Dry-run shows main uses `lowes.lowes_main_list_uc_api`; BSR/detail run through modules that now default to UC-first with ZenRows fallback.
+
+## Main Realtime Benchmark Backfill and Fix
+
+Issue found:
+
+- `lowes/data/ldy/20260517/main/benchmarks` existed, but UC main did not write benchmark files.
+- The completed LDY main run only had `manifest.json`, raw page files, `main_occurrences.csv`, and `main_page_summary.csv`.
+
+Fix:
+
+- Updated `lowes/lowes_main_list_uc_api.py` to write realtime main benchmark artifacts during future UC main runs.
+
+New main artifacts:
+
+```text
+lowes/data/ldy/20260517/main/benchmarks/main_fetch_progress.csv
+lowes/data/ldy/20260517/main/benchmarks/main_fetch_progress.json
+lowes/data/ldy/20260517/main/benchmarks/main_fetch_summary.json
+```
+
+Behavior:
+
+- `main_fetch_progress.csv` is reset at run start and receives one row per fetched search API page.
+- `main_fetch_progress.json` is rewritten after every completed page with counts, rate, ETA, last page count, and last item.
+- `main_fetch_summary.json` is written after the run finishes.
+
+Backfill:
+
+- Generated the three main benchmark files from the existing `lowes/data/ldy/20260517/main/manifest.json`.
+- Backfilled summary:
+  - pages_requested: 13
+  - pages_fetched: 13
+  - successful_http_pages: 13
+  - failed_pages: 0
+  - rows: 312
+  - unique_omni_item_id: 193
+
+Verification:
+
+```powershell
+python -m py_compile lowes\lowes_main_list_uc_api.py
+```
+
+Result: passed.
+
 ## Current Best Known LDY Status
 
 Successful:
@@ -415,6 +562,363 @@ Conclusion:
 - Even with `js_render + antibot + premium_proxy + proxy_country=us + block_resources + custom_headers`, Lowe's search HTML still times out inside ZenRows.
 - Next practical path is `/search/products` API or browser-captured session replay, not full HTML rendering.
 
+### 15:25:05 - Main search HTML with ZenRows UI-like simple params
+
+Reason:
+
+- User showed ZenRows UI where Lowe's URL is configured with JavaScript Rendering, Premium Proxies, and wait selector `.content` / `2500ms`.
+- Added local request variant `js_premium_content_fast` to match that lighter UI-style request.
+
+Command:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'; $env:LOWES_URL_SOURCE='csv'; $env:LOWES_PAGES='1'; $env:LOWES_MAX_ATTEMPTS='1'; $env:ZENROWS_TIMEOUT='240'; $env:LOWES_REQUEST_VARIANT='js_premium_content_fast'; $env:LOWES_HTML_CUSTOM_HEADERS='0'; python -m lowes.lowes_orchestrator --product-type LDY 01
+```
+
+Request params:
+
+```json
+{
+  "js_render": "true",
+  "premium_proxy": "true",
+  "wait_for": ".content",
+  "wait": "2500"
+}
+```
+
+Result:
+
+- Started: `2026-05-17T15:25:05`
+- Finished: `2026-05-17T15:28:06`
+- Elapsed: `181.245s`
+- Status: `504 CTX0002`
+- Response bytes: `153`
+- Rows: 0
+
+Conclusion:
+
+- The failure is not caused only by extra params such as `antibot`, custom headers, US proxy pinning, or block resources.
+- Even the simpler ZenRows UI-like request times out for Lowe's search HTML.
+- Direct local browser display is not equivalent to ZenRows remote browser extraction; the remote browser session still appears to hang or be challenged before ZenRows returns HTML.
+
+### 15:29:19 - Parse saved local main search HTML
+
+Input file:
+
+```text
+lowes/references/lowes_ldy_main_page.html
+```
+
+File size:
+
+```text
+9,303,192 bytes on disk
+9,302,718 bytes read as HTML text in parser
+```
+
+Finding:
+
+- The local HTML contains `window['__PRELOADED_STATE__']`.
+- Existing Lowe's search parser can read it.
+- Parsed `itemList=24`.
+- Parsed `html_prices=24`.
+- Page-level product count is `151`.
+
+Implemented change:
+
+- Added `LOWES_MAIN_SOURCE=local_html`.
+- Added `LOWES_MAIN_LOCAL_HTML=<path>` to feed a saved HTML file into `step01_main_list` without a network request.
+
+Command:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'; $env:LOWES_MAIN_SOURCE='local_html'; $env:LOWES_MAIN_LOCAL_HTML='C:\Users\gom\samsung_crawl\lowes\references\lowes_ldy_main_page.html'; $env:LOWES_PAGES='1'; python -m lowes.lowes_orchestrator --product-type LDY 01 02 07 10
+```
+
+Result:
+
+- `step01_main_list`: 24 rows, 24 unique omni item IDs.
+- `step02_main_targets`: 24 input rows, 24 output rows.
+- `step07_final_targets`: 24 main rows + 24 BSR rows -> 31 final target rows after dedupe.
+- `step10_status_check`: main rows 24, main target rows 24, BSR rows 24, final target rows 31.
+
+Interpretation:
+
+- This proves the saved browser HTML is enough to recover main listing data.
+- The original ZenRows `RESP005` is plausible because the working browser HTML is about 9.3 MB.
+- If ZenRows returns the fully rendered HTML body, the response can exceed plan limits or take long enough to hit CTX0002.
+- Short-term workaround: save browser HTML snapshots and run `LOWES_MAIN_SOURCE=local_html`.
+- Better long-term path: capture/replay the `/search/products` JSON API instead of full HTML.
+
+### 15:31:07 - UC browser API test succeeds
+
+Command:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'; $env:LOWES_SEARCH_TERM='washing machine'; $env:LOWES_PAGES='1'; $env:LOWES_UC_HEADLESS='0'; $env:LOWES_UC_BOOT_WAIT_SECONDS='15'; $env:LOWES_UC_API_WAIT_SECONDS='60'; python -m lowes.lowes_main_list_uc_api
+```
+
+Result:
+
+- UC Chrome launched visible.
+- Store cookies seeded for `0289 / 99503`.
+- Opened:
+
+```text
+https://www.lowes.com/search?searchTerm=washing+machine
+```
+
+- Browser title:
+
+```text
+Washing machine at Lowes.com: Search Results
+```
+
+- Browser-session API request:
+
+```text
+https://www.lowes.com/search/products?searchTerm=washing+machine&offset=0&nearByStores=1633,2955,2512&ac=false&algoRulesAppliedInPageLoad=false
+```
+
+- API status: `200`
+- API elapsed: `0.729s`
+- API response bytes: `432,505`
+- `itemList`: 24
+- `productCount`: 191
+- `adjustedNextOffset`: 22
+- `pagination_page_count`: 8
+- Parsed rows: 24
+- Unique omni item IDs: 24
+
+Artifacts:
+
+```text
+lowes/data/ldy/20260517/main_uc_api/raw/main_pages/page_001_success/page_001_response.json
+lowes/data/ldy/20260517/main_uc_api/parsed/main_occurrences.csv
+lowes/data/ldy/20260517/main_uc_api/manifest.json
+```
+
+Conclusion:
+
+- UC browser-session API is the working equivalent of the BestBuy GraphQL approach for Lowe's search.
+- Full search HTML rendering through ZenRows is the wrong path.
+- For LDY, orchestrator now defaults `step01 main_list` to `lowes.lowes_main_list_uc_api`.
+
+### 15:33:45 - LDY dry-run collection 01-10 with UC main
+
+Command:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'; $env:LOWES_SEARCH_TERM='washing machine'; $env:LOWES_URL_SOURCE='csv'; $env:LOWES_PAGES='13'; $env:LOWES_MAIN_TARGET_LIMIT='300'; $env:LOWES_UC_HEADLESS='0'; $env:LOWES_UC_BOOT_WAIT_SECONDS='15'; $env:LOWES_UC_API_WAIT_SECONDS='60'; $env:LOWES_DETAIL_LIMIT='300'; $env:LOWES_DETAIL_WORKERS='3'; $env:ZENROWS_TIMEOUT='240'; $env:S3_DRY_RUN='1'; python -m lowes.lowes_orchestrator --product-type LDY 01 02 03 04 05 06 07 08 09 10
+```
+
+Main result:
+
+- UC browser launched successfully.
+- Search URL opened successfully.
+- `/search/products` succeeded for 13 requested pages.
+- Each API page returned `status=200`, `itemList=24`.
+- API-reported `productCount=192`.
+- API-reported `pagination_page_count=8`.
+- Parsed occurrences: 312.
+- Unique `omni_item_id`: 193.
+- `step02_main_targets`: 193 rows.
+
+Important note:
+
+- 18 pages are not needed for this run.
+- Page 8 already reports `pagination_page_count=8`.
+- Pages 9-13 returned data but were beyond the reported page count and produced duplicates/repeated tail data.
+- Code updated so UC main can stop when reported `pagination_page_count` is exceeded (`LOWES_UC_STOP_AT_PAGE_COUNT=1` by default).
+
+BSR result:
+
+- BSR HTTP 200 through ZenRows.
+- BSR parsed rows: 24.
+- BSR rank map rows: 24.
+
+Promotion/trending/review:
+
+- Promotion skipped by design: source not configured.
+- Trending skipped by design: source not configured.
+- Review20 skipped by design: source not configured.
+
+Final target result:
+
+- `main_rows`: 193.
+- `bsr_rows`: 24.
+- `final_target_rows`: 193.
+- BSR did not add extra unique rows beyond main after dedupe.
+
+Detail first pass result:
+
+- Default detail mode was `missing_price`.
+- Main rows already had prices, so detail target rows were 0.
+- This did not satisfy the intended "fetch all details" run.
+
+### 15:35:45-16:27:54 - Detail all-target run
+
+Command:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'; $env:LOWES_DETAIL_TARGET_MODE='all'; $env:LOWES_DETAIL_LIMIT='300'; $env:LOWES_DETAIL_WORKERS='3'; $env:ZENROWS_TIMEOUT='240'; python -m lowes.lowes_orchestrator --product-type LDY 08 09 10
+```
+
+Detail result:
+
+- Detail target mode: `all`.
+- Detail target rows: 193.
+- Unique detail pages: 193.
+- Detail output rows: 193.
+- Detail failure rows: 8.
+- Status check `detail_success_files`: 188.
+- Resolved detail prices: 167/193.
+- `final_output.csv`: 193 rows.
+
+Failures:
+
+All 8 failures were ZenRows `422 RESP001` and marked retryable:
+
+```text
+5013548885
+1000704380
+5014906275
+5016333377
+5014349161
+5017781001
+5017759985
+5017970755
+```
+
+Failure file:
+
+```text
+lowes/data/ldy/20260517/detail/parsed/detail_failures.csv
+```
+
+Interpretation:
+
+- Main collection should be UC-first.
+- Detail currently uses ZenRows; failures are isolated to 8 PDP URLs.
+- A future improvement should add UC/browser-session fallback for detail failures, then ZenRows as fallback only if UC fails.
+
+### 17:23:36 - S3 dry-run
+
+Command:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'; $env:S3_DRY_RUN='1'; python -m lowes.step11_s3_sync
+```
+
+Result:
+
+- S3 dry-run command succeeded.
+- No files were uploaded because `--dryrun` was enabled.
+- Target URI:
+
+```text
+s3://dx-crawl-fileserver-bucket/retail_backup/lowes/ldy/20260517
+```
+
+S3 settings:
+
+```text
+bucket=dx-crawl-fileserver-bucket
+prefix=retail_backup
+retailer=lowes
+product_type=ldy
+run_date=20260517
+upload_raw=true
+storage_class=STANDARD
+delete_extra=false
+dry_run=true
+```
+
+S3 manifest:
+
+```text
+lowes/data/ldy/20260517/s3_sync_manifest.json
+```
+
+### DB destination status
+
+DB prepare/load were not run after the 193-row detail-all result because this was treated as a dry run.
+
+If DB steps are run with current configuration, target destination is:
+
+```text
+schema=public
+table=tmp_lowes_ldy_final_output_20260517
+csv=lowes/data/ldy/20260517/output/final_output.csv
+rows_now=193
+```
+
+Previous DB load before full detail run:
+
+- Time: `15:04:13-15:04:26`
+- CSV rows: 24
+- Inserted: 24
+- Table: `public.tmp_lowes_ldy_final_output_20260517`
+
+Current latest DB load manifest is stale relative to the new 193-row `final_output.csv`; do not treat it as proof that the 193-row output has been loaded.
+
+## Current Recommended Lowe's Strategy
+
+1. Main listing: UC/browser-session `/search/products` first.
+2. Stop main listing at API-reported `pagination.pageCount`; do not blindly run to 18+ pages.
+3. BSR: ZenRows is currently okay because BSR page is small and includes preloaded product state.
+4. Detail: current ZenRows path mostly works but has retryable 422s. Add UC fallback for failed PDP detail URLs.
+5. ZenRows full search HTML should remain disabled for main because it hits `RESP005`/`CTX0002`.
+
+### Browser-loaded page extraction plan
+
+Issue:
+
+- The page can load in a normal browser, but full HTML download is unreliable or too large.
+- The useful product data is already present in browser memory as `window.__PRELOADED_STATE__.itemList`.
+
+Implemented:
+
+- Added browser console snippet:
+
+```text
+lowes/references/lowes_copy_search_state_snippet.js
+```
+
+- Added crawler input mode:
+
+```text
+LOWES_MAIN_SOURCE=local_state_json
+LOWES_MAIN_LOCAL_STATE_JSON=<path to copied JSON>
+```
+
+Manual extraction workflow:
+
+1. Open Lowe's search page in the browser.
+2. Open DevTools Console.
+3. Paste and run `lowes/references/lowes_copy_search_state_snippet.js`.
+4. The snippet copies a compact JSON object containing `itemList`, `productCount`, pagination, store context, and offsets.
+5. Paste that clipboard content into:
+
+```text
+lowes/references/lowes_ldy_main_state.json
+```
+
+6. Run:
+
+```powershell
+$env:LOWES_PRODUCT_TYPE='LDY'
+$env:LOWES_MAIN_SOURCE='local_state_json'
+$env:LOWES_MAIN_LOCAL_STATE_JSON='C:\Users\gom\samsung_crawl\lowes\references\lowes_ldy_main_state.json'
+$env:LOWES_PAGES='1'
+python -m lowes.lowes_orchestrator --product-type LDY 01 02 07 10
+```
+
+Reason:
+
+- This avoids downloading or storing the full 9.3 MB rendered HTML.
+- It extracts only the JSON state needed by the existing parser.
+
 ## Important Artifacts
 
 ```text
@@ -457,3 +961,31 @@ python -m lowes.lowes_orchestrator --product-type LDY 01
 ```
 
 3. Keep BSR as current stable seed source for LDY until search is reliable.
+
+## Detail Realtime Benchmark Update
+
+Added realtime benchmark output to `lowes/step08_detail_enrichment.py`.
+
+New detail artifacts:
+
+```text
+lowes/data/ldy/20260517/detail/benchmarks/detail_fetch_progress.csv
+lowes/data/ldy/20260517/detail/benchmarks/detail_fetch_progress.json
+lowes/data/ldy/20260517/detail/benchmarks/detail_fetch_summary.json
+```
+
+Behavior:
+
+- `detail_fetch_progress.csv` is reset at the start of each detail run and gets one row appended as each PDP fetch finishes.
+- `detail_fetch_progress.json` is rewritten after each completed PDP with latest counts, rate, ETA, worker count, timeout, and last item.
+- `detail_fetch_summary.json` is written at the end with final fetch/detail counts and output paths.
+- Cached detail pages are recorded with `from_cache=true`.
+- Failed HTTP/exception rows are recorded immediately, before final parsing.
+
+Verification:
+
+```powershell
+python -m py_compile lowes\step08_detail_enrichment.py
+```
+
+Result: passed.

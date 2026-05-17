@@ -159,7 +159,10 @@ def run_step(step, dry_run=False):
     env = os.environ.copy()
     env.setdefault("LOWES_RUN_ROOT", str(DEFAULT_LOWES_RUN_ROOT))
     env.update(step.env)
-    command = [PYTHON, "-m", step.module]
+    module = step.module
+    if step.name == "main_list":
+        module = env.get("LOWES_MAIN_LIST_MODULE", module)
+    command = [PYTHON, "-m", module]
     print(f"[run] step {step.key} {step.name}: {' '.join(command)}")
     print(f"      LOWES_RUN_ROOT={env.get('LOWES_RUN_ROOT')}")
     if dry_run:
@@ -191,6 +194,11 @@ def main():
     args = parser.parse_args()
 
     os.environ["LOWES_PRODUCT_TYPE"] = str(args.product_type).strip().upper()
+    os.environ.setdefault("LOWES_MAIN_LIST_MODULE", "lowes.lowes_main_list_uc_api")
+    os.environ.setdefault("LOWES_BSR_TRANSPORT", "uc_first")
+    os.environ.setdefault("LOWES_BSR_FALLBACK_ZENROWS", "1")
+    os.environ.setdefault("LOWES_DETAIL_TRANSPORT", "uc_first")
+    os.environ.setdefault("LOWES_DETAIL_FALLBACK_ZENROWS", "1")
     if os.environ["LOWES_PRODUCT_TYPE"] == "LDY":
         os.environ.setdefault("LOWES_SEARCH_TERM", "washing machine")
         os.environ.setdefault("LOWES_BSR_PRODUCT_GROUP", "LDY")
