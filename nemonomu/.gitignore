@@ -1,8 +1,0 @@
-.env
-__pycache__/
-*.py[cod]
-.pytest_cache/
-tv_bby_new/output/
-hhp_bby_new/output/
-output/
-runs/
