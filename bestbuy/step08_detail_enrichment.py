@@ -8,11 +8,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 from lxml import html as lxml_html
-from requests import RequestException
+from requests import RequestException, Session
 from zenrows import ZenRowsClient
 
 from .step00_config import (
@@ -24,7 +25,7 @@ from .step00_config import (
     old_pdp_url,
     rel_path,
 )
-from .step00_detail_benchmarks import write_detail_benchmarks
+from .step00_detail_benchmarks import append_detail_benchmark, write_detail_benchmarks
 from .step00_parse_pdp import event_data, extract_apollo_payloads
 
 RUN_DATE = os.getenv("BESTBUY_RUN_DATE", datetime.now().strftime("%Y%m%d"))
@@ -39,6 +40,7 @@ MAX_ATTEMPTS = int(os.getenv("BESTBUY_DETAIL_MAX_ATTEMPTS", "3"))
 RETRY_ONLY = os.getenv("BESTBUY_DETAIL_RETRY_ONLY", "0").lower() in {"1", "true", "yes", "y"}
 REBUILD_ONLY = os.getenv("BESTBUY_DETAIL_REBUILD_ONLY", "0").lower() in {"1", "true", "yes", "y"}
 REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "240"))
+FETCH_MODE = os.getenv("BESTBUY_FETCH_MODE", os.getenv("BESTBUY_DETAIL_FETCH_MODE", "direct")).strip().lower()
 WORKERS = int(os.getenv("BESTBUY_DETAIL_WORKERS", "1"))
 STAGE = os.getenv("BESTBUY_DETAIL_STAGE", "detail").lower()
 SAVE_HTML_MODE = os.getenv("BESTBUY_SAVE_HTML_MODE", "slim").lower()
@@ -415,6 +417,37 @@ def graphql_params():
         "proxy_country": "us",
         "js_render": "true",
     }
+
+
+def fetch_transports():
+    if FETCH_MODE in {"zenrows", "zr"}:
+        return ["zenrows"]
+    if FETCH_MODE in {"auto", "direct_first", "fallback"}:
+        return ["direct", "zenrows"]
+    return ["direct"]
+
+
+def direct_headers(referer=None, json_request=False):
+    headers = {
+        "accept": "application/json, text/plain, */*" if json_request else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": os.getenv("BESTBUY_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "user-agent": os.getenv(
+            "BESTBUY_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
+    }
+    if json_request:
+        headers["content-type"] = "application/json"
+        headers["origin"] = "https://www.bestbuy.com"
+    if referer:
+        headers["referer"] = referer
+    cookie = os.getenv("BESTBUY_COOKIE", "").strip()
+    if cookie:
+        headers["cookie"] = cookie
+    return headers
 
 
 def load_csv(path):
@@ -827,41 +860,53 @@ def fetch_detail(client, target):
         paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         return meta
 
-    start = time.perf_counter()
-    response = None
-    try:
-        response = client.get(pdp_url, params=detail_params(), timeout=REQUEST_TIMEOUT)
-        html_text = response.text
-        status = response.status_code
-        success = status == 200 and has_product_schema(html_text)
-        paths = detail_paths_for_status(sku, target, success)
-        artifact_meta = write_detail_artifacts(paths, html_text, dict(response.headers))
-        meta.update(
-            {
-                "success": success,
-                "status_code": status,
-                "elapsed_seconds": round(time.perf_counter() - start, 3),
-                "x_request_cost": request_cost(response.headers),
-                "bytes": artifact_meta["full_bytes"],
-                "stored_bytes": artifact_meta["stored_bytes"],
-                "html_mode": artifact_meta["html_mode"],
-                "apollo_payload_count": artifact_meta["apollo_payload_count"],
-                "finished_at": now(),
-                "error": "" if success else "detail_html_missing_product_schema",
-            }
-        )
-    except RequestException as exc:
-        paths = detail_paths_for_status(sku, target, False)
-        meta.update(
-            {
-                "success": False,
-                "status_code": "ERR",
-                "elapsed_seconds": round(time.perf_counter() - start, 3),
-                "x_request_cost": 0,
-                "finished_at": now(),
-                "error": str(exc),
-            }
-        )
+    paths = detail_paths_for_status(sku, target, False)
+    for transport in fetch_transports():
+        if transport == "zenrows" and not client:
+            continue
+        start = time.perf_counter()
+        try:
+            if transport == "zenrows":
+                response = client.get(pdp_url, params=detail_params(), timeout=REQUEST_TIMEOUT)
+            else:
+                response = Session().get(pdp_url, headers=direct_headers(referer="https://www.bestbuy.com/"), timeout=REQUEST_TIMEOUT)
+            html_text = response.text
+            status = response.status_code
+            success = status == 200 and has_product_schema(html_text)
+            paths = detail_paths_for_status(sku, target, success)
+            artifact_meta = write_detail_artifacts(paths, html_text, dict(response.headers))
+            meta.update(
+                {
+                    "success": success,
+                    "status_code": status,
+                    "transport": transport,
+                    "fetch_mode": FETCH_MODE,
+                    "elapsed_seconds": round(time.perf_counter() - start, 3),
+                    "x_request_cost": request_cost(response.headers),
+                    "bytes": artifact_meta["full_bytes"],
+                    "stored_bytes": artifact_meta["stored_bytes"],
+                    "html_mode": artifact_meta["html_mode"],
+                    "apollo_payload_count": artifact_meta["apollo_payload_count"],
+                    "finished_at": now(),
+                    "error": "" if success else "detail_html_missing_product_schema",
+                }
+            )
+        except RequestException as exc:
+            paths = detail_paths_for_status(sku, target, False)
+            meta.update(
+                {
+                    "success": False,
+                    "status_code": "ERR",
+                    "transport": transport,
+                    "fetch_mode": FETCH_MODE,
+                    "elapsed_seconds": round(time.perf_counter() - start, 3),
+                    "x_request_cost": 0,
+                    "finished_at": now(),
+                    "error": str(exc),
+                }
+            )
+        if meta.get("success"):
+            break
     paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return meta
 
@@ -889,20 +934,47 @@ def fetch_review20(client, target):
     paths = review_paths_for_status(sku, target, False)
     paths["request"].write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    start = time.perf_counter()
-    try:
-        response = client.post(
-            "https://www.bestbuy.com/gateway/graphql",
-            params=graphql_params(),
-            headers={
-                "accept": "application/json, text/plain, */*",
-                "content-type": "application/json",
-                "origin": "https://www.bestbuy.com",
-                "referer": pdp_url,
-            },
-            data=json.dumps(payload),
-            timeout=REQUEST_TIMEOUT,
-        )
+    for transport in fetch_transports():
+        if transport == "zenrows" and not client:
+            continue
+        start = time.perf_counter()
+        try:
+            if transport == "zenrows":
+                response = client.post(
+                    "https://www.bestbuy.com/gateway/graphql",
+                    params=graphql_params(),
+                    headers={
+                        "accept": "application/json, text/plain, */*",
+                        "content-type": "application/json",
+                        "origin": "https://www.bestbuy.com",
+                        "referer": pdp_url,
+                    },
+                    data=json.dumps(payload),
+                    timeout=REQUEST_TIMEOUT,
+                )
+            else:
+                response = Session().post(
+                    "https://www.bestbuy.com/gateway/graphql",
+                    headers=direct_headers(referer=pdp_url, json_request=True),
+                    data=json.dumps(payload),
+                    timeout=REQUEST_TIMEOUT,
+                )
+        except RequestException as exc:
+            paths = review_paths_for_status(sku, target, False)
+            meta.update(
+                {
+                    "success": False,
+                    "status_code": "ERR",
+                    "transport": transport,
+                    "fetch_mode": FETCH_MODE,
+                    "elapsed_seconds": round(time.perf_counter() - start, 3),
+                    "x_request_cost": 0,
+                    "finished_at": now(),
+                    "error": str(exc),
+                }
+            )
+            paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+            continue
         text = response.text
         review_count = 0
         error = ""
@@ -930,6 +1002,8 @@ def fetch_review20(client, target):
             {
                 "success": success,
                 "status_code": response.status_code,
+                "transport": transport,
+                "fetch_mode": FETCH_MODE,
                 "elapsed_seconds": round(time.perf_counter() - start, 3),
                 "x_request_cost": request_cost(response.headers),
                 "bytes": len(text or ""),
@@ -938,18 +1012,8 @@ def fetch_review20(client, target):
                 "error": error if not success else "",
             }
         )
-    except RequestException as exc:
-        paths = review_paths_for_status(sku, target, False)
-        meta.update(
-            {
-                "success": False,
-                "status_code": "ERR",
-                "elapsed_seconds": round(time.perf_counter() - start, 3),
-                "x_request_cost": 0,
-                "finished_at": now(),
-                "error": str(exc),
-            }
-        )
+        if meta.get("success"):
+            break
     paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return meta
 
@@ -1267,15 +1331,19 @@ def main():
     output_targets = target_rows(apply_filters=False)
     api_key = "" if REBUILD_ONLY else os.getenv("ZENROWS_API_KEY")
     client = ZenRowsClient(api_key) if api_key else None
+    can_fetch_network = not REBUILD_ONLY and ("direct" in fetch_transports() or client is not None)
 
     RAW_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
     RAW_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
     PARSED_DIR.mkdir(parents=True, exist_ok=True)
+    BENCHMARKS_DIR.mkdir(parents=True, exist_ok=True)
+    if not REBUILD_ONLY and DETAIL_BENCHMARKS_CSV.exists():
+        DETAIL_BENCHMARKS_CSV.unlink()
 
     if STAGE not in {"all", "detail", "review"}:
         raise RuntimeError("BESTBUY_DETAIL_STAGE must be one of: all, detail, review")
 
-    if not client and not REBUILD_ONLY:
+    if not can_fetch_network and not REBUILD_ONLY:
         # Cached parse-only mode is useful during local development.
         if STAGE == "detail":
             missing = [row.get("sku_id") for row in targets if not detail_success(row.get("sku_id"))]
@@ -1288,24 +1356,28 @@ def main():
                 if not detail_success(row.get("sku_id")) or not review_success(row.get("sku_id"))
             ]
         if missing:
-            raise RuntimeError("Set ZENROWS_API_KEY or provide cached detail/review files for all selected SKUs")
+            raise RuntimeError("Enable direct fetch, set ZENROWS_API_KEY, or provide cached detail/review files for all selected SKUs")
+
+    benchmark_lock = Lock()
 
     def process_target(index, target):
         sku = str(target.get("sku_id") or "").strip()
         fetched_detail = False
         fetched_review = False
         if STAGE in {"all", "detail"}:
-            should_fetch_detail = client and not detail_success(sku)
+            should_fetch_detail = can_fetch_network and not detail_success(sku)
             dmeta = fetch_detail(client, target) if should_fetch_detail else read_json(detail_paths(sku)["meta"])
             fetched_detail = bool(should_fetch_detail)
         else:
             dmeta = read_json(detail_paths(sku)["meta"])
         if STAGE in {"all", "review"}:
-            should_fetch_review = client and dmeta.get("success") and not review_success(sku)
+            should_fetch_review = can_fetch_network and dmeta.get("success") and not review_success(sku)
             rmeta = fetch_review20(client, target) if should_fetch_review else read_json(review_paths(sku)["meta"])
             fetched_review = bool(should_fetch_review)
         else:
             rmeta = read_json(review_paths(sku)["meta"])
+        with benchmark_lock:
+            append_detail_benchmark(target, DETAIL_ROOT, DETAIL_BENCHMARKS_CSV)
         return index, sku, dmeta, rmeta, fetched_detail, fetched_review
 
     detail_cost = 0.0
@@ -1363,6 +1435,8 @@ def main():
         "stage": STAGE,
         "workers": WORKERS,
         "max_attempts": MAX_ATTEMPTS,
+        "fetch_mode": FETCH_MODE,
+        "fetch_transports": fetch_transports(),
         "target_count": len(output_targets),
         "processed_count": len(targets),
         "success_count": len(enriched_rows),

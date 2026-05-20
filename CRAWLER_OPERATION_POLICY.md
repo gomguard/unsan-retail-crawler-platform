@@ -204,6 +204,66 @@ Per-run logs should continue to be written under:
 {retailer}/data/{product_type}/{YYYYMMDD}/{subject}/logs/run.log
 ```
 
+## Cost-First Collection Strategy
+
+Crawler development should avoid paid/proxy-heavy collection until a cheaper
+path has been tested and documented.
+
+For Amazon, Best Buy, Lowe's, Walmart, and future retailers, keep at least two
+collection plans in mind:
+
+1. Low-cost/direct path.
+2. ZenRows/proxy fallback path.
+
+Preferred escalation order:
+
+```text
+official API or public JSON/GraphQL
+  -> direct requests/curl with stable headers
+  -> local browser/session capture or copied state JSON
+  -> Playwright/browser automation without paid proxy
+  -> ZenRows basic/auto
+  -> ZenRows js_render
+  -> ZenRows antibot/premium_proxy/long waits
+```
+
+Rules:
+
+1. Test the low-cost/direct path first unless the retailer is already known to
+   require ZenRows for that exact endpoint.
+2. Limit early tests with page/detail caps before any full crawl.
+3. Do not use expensive ZenRows settings as the default until the dev log shows
+   why cheaper options failed.
+4. Preserve raw artifacts so parser fixes do not require another paid fetch.
+5. Record request count, retries, timeouts, and ZenRows flags in the dev log so
+   cost can be estimated after the run.
+6. If a manual browser capture is used, treat it as a diagnostic or bootstrap
+   path unless it can be made repeatable.
+
+## Realtime Benchmark Policy
+
+Benchmark files are operational telemetry, not only final reports. Collection
+steps must append benchmark rows as each request unit finishes.
+
+Examples:
+
+```text
+main/benchmarks/page_benchmarks.csv
+bsr/benchmarks/page_benchmarks.csv
+detail/benchmarks/detail_benchmarks.csv
+```
+
+Rules:
+
+1. Append one benchmark row immediately after each page, SKU, placement, or
+   request unit completes.
+2. Include transport/source fields such as `direct`, `raw_cache`, or `zenrows`.
+3. Include status, elapsed time, bytes, item count, raw response path, and
+   request cost when available.
+4. It is acceptable to rebuild the same benchmark file at the end for clean
+   ordering and derived totals, but long runs must have useful partial
+   benchmark rows while they are still running.
+
 ## Raw Artifact Policy
 
 Raw artifacts are grouped by request unit, not dumped flat into one folder.

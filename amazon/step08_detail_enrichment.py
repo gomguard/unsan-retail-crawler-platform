@@ -7,10 +7,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from requests import RequestException
+from requests import RequestException, Session
 from zenrows import ZenRowsClient
 
 from .step00_config import AMAZON_BASE_URL, DEFAULT_AMAZON_RUN_ROOT, load_env, rel_path
+from .step00_direct import get_with_interstitial_retry
 from .step00_parse_search import clean_text
 
 
@@ -27,10 +28,13 @@ FINAL_OUTPUT_CSV = Path(os.getenv("AMAZON_FINAL_OUTPUT", RUN_ROOT / "output" / "
 REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "180"))
 MAX_ATTEMPTS = int(os.getenv("AMAZON_DETAIL_MAX_ATTEMPTS", "2"))
 RETRY_SLEEP_SECONDS = int(os.getenv("AMAZON_RETRY_SLEEP_SECONDS", "10"))
+FETCH_MODE = os.getenv("AMAZON_FETCH_MODE", os.getenv("AMAZON_DETAIL_FETCH_MODE", "direct")).strip().lower()
 DETAIL_LIMIT = int(os.getenv("AMAZON_DETAIL_LIMIT", "0"))
+FORCE_ALL_DETAILS = os.getenv("AMAZON_DETAIL_FORCE_ALL", "0").strip().lower() in {"1", "true", "yes", "y"}
 USE_RAW_CACHE = os.getenv("AMAZON_DETAIL_USE_RAW_CACHE", "1").strip().lower() in {"1", "true", "yes", "y"}
 REFRESH_EMPTY_CACHE = os.getenv("AMAZON_DETAIL_REFRESH_EMPTY_CACHE", "0").strip().lower() in {"1", "true", "yes", "y"}
 RERUN_FINAL_TARGETS = os.getenv("AMAZON_DETAIL_RERUN_FINAL_TARGETS", "1").strip().lower() in {"1", "true", "yes", "y"}
+CLEAR_DETAIL_BENCHMARKS = os.getenv("AMAZON_DETAIL_CLEAR_BENCHMARKS", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 REQUEST_PARAMS = {
     "premium_proxy": os.getenv("AMAZON_DETAIL_PREMIUM_PROXY", os.getenv("AMAZON_PREMIUM_PROXY", "true")),
@@ -56,6 +60,33 @@ def zenrows_client():
     return ZenRowsClient(api_key)
 
 
+def direct_headers():
+    headers = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": os.getenv("AMAZON_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "upgrade-insecure-requests": "1",
+        "user-agent": os.getenv(
+            "AMAZON_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
+    }
+    cookie = os.getenv("AMAZON_COOKIE", "").strip()
+    if cookie:
+        headers["cookie"] = cookie
+    return headers
+
+
+def fetch_transports():
+    if FETCH_MODE in {"zenrows", "zr"}:
+        return ["zenrows"]
+    if FETCH_MODE in {"auto", "direct_first", "fallback"}:
+        return ["direct", "zenrows"]
+    return ["direct"]
+
+
 def read_csv(path):
     if not path.exists():
         return []
@@ -75,6 +106,33 @@ def write_csv(path, rows, preferred=None):
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def append_csv(path, row, fieldnames):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+DETAIL_BENCHMARKS_CSV = DETAIL_ROOT / "benchmarks" / "detail_benchmarks.csv"
+DETAIL_BENCHMARK_FIELDS = [
+    "asin",
+    "status_code",
+    "detail_status",
+    "transport",
+    "direct_challenge_solved",
+    "cache_hit",
+    "elapsed_seconds",
+    "x_request_cost",
+    "bytes",
+    "interstitial_challenge",
+    "body_path",
+    "error",
+]
 
 
 def compact_json(value):
@@ -212,6 +270,7 @@ def cached_detail(asin):
         "error": "",
         "cache_hit": True,
         "elapsed_seconds": 0,
+        "transport": "raw_cache",
     }
 
 
@@ -234,39 +293,55 @@ def fetch_detail(asin):
     url = f"{AMAZON_BASE_URL}/dp/{asin}"
     last_result = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        start = time.time()
-        try:
-            response = zenrows_client().get(url, params=REQUEST_PARAMS, timeout=REQUEST_TIMEOUT)
-            result = {
-                "asin": asin,
-                "attempt": attempt,
-                "url": url,
-                "started_at": now(),
-                "finished_at": now(),
-                "elapsed_seconds": round(time.time() - start, 3),
-                "status_code": response.status_code,
-                "headers": dict(response.headers),
-                "text": response.text,
-                "error": "",
-            }
-        except RequestException as exc:
-            result = {
-                "asin": asin,
-                "attempt": attempt,
-                "url": url,
-                "started_at": now(),
-                "finished_at": now(),
-                "elapsed_seconds": round(time.time() - start, 3),
-                "status_code": "",
-                "headers": {},
-                "text": "",
-                "error": str(exc),
-            }
-        save_detail_result(result)
-        last_result = result
-        parsed = parse_detail_html(result.get("text", ""), asin)
-        if result.get("status_code") == 200 and parsed.get("product_name") and not is_interstitial(result.get("text", "")):
-            return result
+        for transport in fetch_transports():
+            if transport == "zenrows" and not os.getenv("ZENROWS_API_KEY"):
+                continue
+            start = time.time()
+            try:
+                if transport == "zenrows":
+                    response = zenrows_client().get(url, params=REQUEST_PARAMS, timeout=REQUEST_TIMEOUT)
+                    challenge_solved = False
+                    challenge_error = ""
+                else:
+                    response, challenge_solved, challenge_error = get_with_interstitial_retry(
+                        Session(), url, direct_headers(), REQUEST_TIMEOUT
+                    )
+                result = {
+                    "asin": asin,
+                    "attempt": attempt,
+                    "url": url,
+                    "started_at": now(),
+                    "finished_at": now(),
+                    "elapsed_seconds": round(time.time() - start, 3),
+                    "status_code": response.status_code,
+                    "headers": dict(response.headers),
+                    "text": response.text,
+                    "transport": transport,
+                    "direct_challenge_solved": challenge_solved,
+                    "direct_challenge_error": challenge_error,
+                    "error": "",
+                }
+            except RequestException as exc:
+                result = {
+                    "asin": asin,
+                    "attempt": attempt,
+                    "url": url,
+                    "started_at": now(),
+                    "finished_at": now(),
+                    "elapsed_seconds": round(time.time() - start, 3),
+                    "status_code": "",
+                    "headers": {},
+                    "text": "",
+                    "transport": transport,
+                    "direct_challenge_solved": False,
+                    "direct_challenge_error": "",
+                    "error": str(exc),
+                }
+            save_detail_result(result)
+            last_result = result
+            parsed = parse_detail_html(result.get("text", ""), asin)
+            if result.get("status_code") == 200 and parsed.get("product_name") and not is_interstitial(result.get("text", "")):
+                return result
         if attempt < MAX_ATTEMPTS:
             time.sleep(RETRY_SLEEP_SECONDS)
     return last_result
@@ -282,7 +357,7 @@ def candidate_asins():
         asin = str(row.get("asin") or row.get("sku_id") or "").strip()
         if not asin or asin in seen:
             continue
-        if row.get("product_name") and row.get("image_url") and row.get("customer_price"):
+        if not FORCE_ALL_DETAILS and row.get("product_name") and row.get("image_url") and row.get("customer_price"):
             continue
         seen.add(asin)
         output.append(asin)
@@ -328,6 +403,8 @@ def write_final_output_copy():
 def main():
     make_dirs()
     started_at = now()
+    if CLEAR_DETAIL_BENCHMARKS and DETAIL_BENCHMARKS_CSV.exists():
+        DETAIL_BENCHMARKS_CSV.unlink()
     existing = merge_existing_details(read_csv(DETAIL_MAP_CSV))
     failures = []
     parsed_by_asin = dict(existing)
@@ -339,7 +416,26 @@ def main():
         parsed["detail_status_code"] = result.get("status_code", "")
         parsed["detail_elapsed_seconds"] = result.get("elapsed_seconds", "")
         parsed["detail_x_request_cost"] = (result.get("headers") or {}).get("X-Request-Cost", "")
+        parsed["detail_transport"] = result.get("transport", "")
         parsed_by_asin[asin] = parsed
+        append_csv(
+            DETAIL_BENCHMARKS_CSV,
+            {
+                "asin": asin,
+                "status_code": result.get("status_code", ""),
+                "detail_status": parsed.get("detail_status", ""),
+                "transport": result.get("transport", ""),
+                "direct_challenge_solved": result.get("direct_challenge_solved", ""),
+                "cache_hit": "1" if result.get("cache_hit") else "",
+                "elapsed_seconds": result.get("elapsed_seconds", ""),
+                "x_request_cost": (result.get("headers") or {}).get("X-Request-Cost", ""),
+                "bytes": len(result.get("text", "")),
+                "interstitial_challenge": str(int(is_interstitial(result.get("text", "")))),
+                "body_path": rel_path(DETAIL_ROOT / "raw" / "detail_html" / f"{asin}.html"),
+                "error": result.get("error", ""),
+            },
+            DETAIL_BENCHMARK_FIELDS,
+        )
         if not parsed.get("product_name"):
             failures.append({"asin": asin, "status_code": result.get("status_code", ""), "error": result.get("error", ""), "detail_status": parsed.get("detail_status", "")})
         print(f"detail {index}/{len(asins)} asin={asin} status={result.get('status_code') or 'ERR'} name={'yes' if parsed.get('product_name') else 'no'}")
@@ -364,6 +460,7 @@ def main():
             "detail_cache_hit",
             "detail_elapsed_seconds",
             "detail_x_request_cost",
+            "detail_transport",
         ],
     )
     write_csv(DETAIL_FAILURES_CSV, failures, preferred=["asin", "status_code", "detail_status", "error"])
@@ -380,10 +477,14 @@ def main():
         "run_root": rel_path(RUN_ROOT),
         "detail_root": rel_path(DETAIL_ROOT),
         "candidate_count": len(asins),
+        "force_all_details": FORCE_ALL_DETAILS,
+        "fetch_mode": FETCH_MODE,
+        "fetch_transports": fetch_transports(),
         "detail_count": len(detail_rows),
         "failure_count": len(failures),
         "detail_map_csv": rel_path(DETAIL_MAP_CSV),
         "detail_failures_csv": rel_path(DETAIL_FAILURES_CSV),
+        "detail_benchmarks_csv": rel_path(DETAIL_BENCHMARKS_CSV),
         "final_output_csv": rel_path(FINAL_OUTPUT_CSV),
         "reran_final_targets": RERUN_FINAL_TARGETS,
         "started_at": started_at,

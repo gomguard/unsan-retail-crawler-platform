@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
+from requests import RequestException, Session
 from zenrows import ZenRowsClient
 
 from .step00_config import (
@@ -27,6 +28,7 @@ SEARCH_SORT = os.getenv("BESTBUY_SEARCH_SORT", "")
 SEARCH_PAGES = int(os.getenv("BESTBUY_MAIN_PAGES", "13"))
 ORGANIC_OFFSET = int(os.getenv("BESTBUY_MAIN_ORGANIC_OFFSET", "18"))
 REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "120"))
+FETCH_MODE = os.getenv("BESTBUY_FETCH_MODE", os.getenv("BESTBUY_GRAPHQL_FETCH_MODE", "direct")).strip().lower()
 RUN_DATE = os.getenv("BESTBUY_RUN_DATE", datetime.now().strftime("%Y%m%d"))
 RUN_ID = os.getenv("BESTBUY_MAIN_RUN_ID", "main")
 RUN_ROOT = Path(os.getenv("BESTBUY_RUN_ROOT", DEFAULT_BESTBUY_RUN_ROOT)) / RUN_ID
@@ -121,7 +123,34 @@ def zenrows_params():
     return params
 
 
-def post_graphql(client, payload, page):
+def graphql_headers(page):
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": os.getenv("BESTBUY_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
+        "content-type": "application/json",
+        "origin": BESTBUY_BASE_URL,
+        "referer": build_search_url(page),
+        "user-agent": os.getenv(
+            "BESTBUY_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
+    }
+    cookie = os.getenv("BESTBUY_COOKIE", "").strip()
+    if cookie:
+        headers["cookie"] = cookie
+    return headers
+
+
+def fetch_transports():
+    if FETCH_MODE in {"zenrows", "zr"}:
+        return ["zenrows"]
+    if FETCH_MODE in {"auto", "direct_first", "fallback"}:
+        return ["direct", "zenrows"]
+    return ["direct"]
+
+
+def post_graphql(client, payload, page, transport):
     headers = {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
@@ -130,15 +159,23 @@ def post_graphql(client, payload, page):
     }
     start = time.perf_counter()
     started_at = now()
-    response = client.post(
-        GRAPHQL_ENDPOINT,
-        params=zenrows_params(),
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=REQUEST_TIMEOUT,
-    )
+    if transport == "zenrows":
+        response = client.post(
+            GRAPHQL_ENDPOINT,
+            params=zenrows_params(),
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=REQUEST_TIMEOUT,
+        )
+    else:
+        response = Session().post(
+            GRAPHQL_ENDPOINT,
+            headers=graphql_headers(page),
+            data=json.dumps(payload),
+            timeout=REQUEST_TIMEOUT,
+        )
     elapsed = time.perf_counter() - start
-    return response, started_at, now(), round(elapsed, 3)
+    return response, started_at, now(), round(elapsed, 3), transport
 
 
 def make_dirs():
@@ -201,7 +238,7 @@ def load_cached_page(page):
     return response_json, meta, rows
 
 
-def save_page_artifacts(page, payload, response, started_at, finished_at, elapsed):
+def save_page_artifacts(page, payload, response, started_at, finished_at, elapsed, transport):
     status = "success" if response.status_code == 200 else "fail"
     paths = page_artifact_paths(page, status)
     request_path = paths["request"]
@@ -229,6 +266,8 @@ def save_page_artifacts(page, payload, response, started_at, finished_at, elapse
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_seconds": elapsed,
+        "transport": transport,
+        "fetch_mode": FETCH_MODE,
         "status_code": response.status_code,
         "x_request_cost": response.headers.get("x-request-cost", ""),
         "bytes": len(response.text or ""),
@@ -434,6 +473,16 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def append_csv(path, row, fieldnames):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def page_summary(page, rows, meta, response_json):
     errors = response_json.get("errors", []) if isinstance(response_json, dict) else []
     organic = [row for row in rows if row.get("container_type") == "organic_product"]
@@ -445,6 +494,7 @@ def page_summary(page, rows, meta, response_json):
         "finished_at": meta["finished_at"],
         "elapsed_seconds": meta["elapsed_seconds"],
         "status_code": meta["status_code"],
+        "transport": meta.get("transport", ""),
         "x_request_cost": meta["x_request_cost"],
         "bytes": meta["bytes"],
         "error_count": len(errors),
@@ -463,7 +513,8 @@ def page_summary(page, rows, meta, response_json):
 
 def main():
     api_key = os.getenv("ZENROWS_API_KEY")
-    if not api_key:
+    needs_zenrows = any(item == "zenrows" for item in fetch_transports())
+    if needs_zenrows and not api_key and FETCH_MODE in {"zenrows", "zr"}:
         raise RuntimeError("Set ZENROWS_API_KEY in .env")
     make_dirs()
     run_started_at = now()
@@ -471,11 +522,14 @@ def main():
 
     html_text = SOURCE_HTML_PATH.read_text(encoding="utf-8", errors="replace")
     operation = find_started_operation(html_text, "PlpView_ProductList_Init")
-    client = ZenRowsClient(api_key)
+    client = ZenRowsClient(api_key) if api_key else None
 
     all_rows = []
     page_benchmarks = []
     raw_search = []
+    realtime_benchmarks_path = RUN_ROOT / "benchmarks" / "page_benchmarks.csv"
+    if realtime_benchmarks_path.exists():
+        realtime_benchmarks_path.unlink()
 
     print(f"RUN_ROOT={RUN_ROOT}")
     print(f"SEARCH_TERM={SEARCH_TERM} pages={SEARCH_PAGES} endpoint={GRAPHQL_ENDPOINT}")
@@ -488,14 +542,42 @@ def main():
             source = "cache"
         else:
             payload = prepare_product_list_payload(operation, page)
-            response, started_at, finished_at, elapsed = post_graphql(client, payload, page)
-            response_json, meta = save_page_artifacts(page, payload, response, started_at, finished_at, elapsed)
-            rows = parse_page_rows(page, response_json) if response.status_code == 200 else []
+            response_json = {}
+            rows = []
+            meta = {}
+            source = "network"
+            for transport in fetch_transports():
+                if transport == "zenrows" and not client:
+                    continue
+                try:
+                    response, started_at, finished_at, elapsed, transport = post_graphql(client, payload, page, transport)
+                    response_json, meta = save_page_artifacts(page, payload, response, started_at, finished_at, elapsed, transport)
+                    rows = parse_page_rows(page, response_json) if response.status_code == 200 else []
+                except RequestException as exc:
+                    meta = {
+                        "page": page,
+                        "url": build_search_url(page),
+                        "started_at": now(),
+                        "finished_at": now(),
+                        "elapsed_seconds": 0,
+                        "transport": transport,
+                        "fetch_mode": FETCH_MODE,
+                        "status_code": "ERR",
+                        "x_request_cost": "",
+                        "bytes": 0,
+                        "parse_error": "",
+                        "error": str(exc),
+                        "response_json_path": "",
+                        "response_path": "",
+                    }
+                if rows:
+                    break
             source = "network"
         all_rows.extend(rows)
         summary = page_summary(page, rows, meta, response_json)
         summary["source"] = source
         page_benchmarks.append(summary)
+        append_csv(realtime_benchmarks_path, summary, list(summary.keys()))
         raw_search.append(
             {
                 "page": page,
@@ -542,6 +624,8 @@ def main():
         "search_pages": SEARCH_PAGES,
         "organic_offset": ORGANIC_OFFSET,
         "graphql_endpoint": GRAPHQL_ENDPOINT,
+        "fetch_mode": FETCH_MODE,
+        "fetch_transports": fetch_transports(),
         "source_html": rel_path(SOURCE_HTML_PATH),
         "expected_post_calls": SEARCH_PAGES,
         "actual_post_calls": len(page_benchmarks),

@@ -45,3 +45,33 @@ Runtime scripts should still write their own per-run logs under:
 
 The development log is the human audit trail for why we tried something and
 what we learned. The per-run log is the machine/runtime trace.
+
+## Cost-First Crawl Strategy
+
+For Amazon, Best Buy, Lowe's, and future retailer crawlers, start with at least
+two collection approaches before settling on a paid/proxy-heavy path.
+
+Default order:
+
+1. Try low-cost direct collection first: official API, public JSON/GraphQL,
+   browser-copied state JSON, direct `requests`, Playwright without paid proxy,
+   or curl with a real browser/session export.
+2. If direct collection is blocked, incomplete, unstable, or too manual, retry
+   with the cheapest ZenRows mode that can test the hypothesis.
+3. Escalate to ZenRows `js_render`, `antibot`, `premium_proxy`, longer waits, or
+   other high-cost options only after recording why cheaper paths failed.
+
+Record the direct attempt and the ZenRows fallback in the development log,
+including cost-sensitive settings such as request count, timeout, retry count,
+`js_render`, `premium_proxy`, `antibot`, and expected raw artifact reuse.
+
+## Realtime Benchmarks
+
+Crawler benchmark CSVs must be appended as each page, SKU, placement, or request
+unit completes. Do not wait until the end of the script to create benchmark
+rows.
+
+Final benchmark rebuilds may still run at the end to normalize ordering and
+fill derived columns, but a partial benchmark file should exist during long
+runs so interrupted crawls still leave timing, status, cost, and transport
+evidence.

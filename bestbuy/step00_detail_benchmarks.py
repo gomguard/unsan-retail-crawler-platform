@@ -19,6 +19,7 @@ DETAIL_BENCHMARK_FIELDS = [
     "detail_attempt",
     "detail_elapsed_seconds",
     "detail_x_request_cost",
+    "detail_transport",
     "detail_bytes",
     "detail_stored_bytes",
     "detail_html_mode",
@@ -33,6 +34,7 @@ DETAIL_BENCHMARK_FIELDS = [
     "review_attempt",
     "review_elapsed_seconds",
     "review_x_request_cost",
+    "review_transport",
     "review_bytes",
     "review_count_returned",
     "review_started_at",
@@ -69,6 +71,17 @@ def write_csv(path, rows):
         writer = csv.DictWriter(f, fieldnames=DETAIL_BENCHMARK_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def append_csv(path, row):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DETAIL_BENCHMARK_FIELDS, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def as_float(value):
@@ -135,6 +148,7 @@ def benchmark_row(target, detail_root):
         "detail_attempt": dmeta.get("attempt", ""),
         "detail_elapsed_seconds": dmeta.get("elapsed_seconds", ""),
         "detail_x_request_cost": dmeta.get("x_request_cost", ""),
+        "detail_transport": dmeta.get("transport", ""),
         "detail_bytes": dmeta.get("bytes", ""),
         "detail_stored_bytes": dmeta.get("stored_bytes", ""),
         "detail_html_mode": dmeta.get("html_mode", ""),
@@ -149,6 +163,7 @@ def benchmark_row(target, detail_root):
         "review_attempt": rmeta.get("attempt", ""),
         "review_elapsed_seconds": rmeta.get("elapsed_seconds", ""),
         "review_x_request_cost": rmeta.get("x_request_cost", ""),
+        "review_transport": rmeta.get("transport", ""),
         "review_bytes": rmeta.get("bytes", ""),
         "review_count_returned": rmeta.get("review_count_returned", ""),
         "review_started_at": rmeta.get("started_at", ""),
@@ -176,3 +191,9 @@ def write_detail_benchmarks(target_csv, detail_root, output_csv):
     rows = build_detail_benchmarks(target_csv, detail_root)
     write_csv(output_csv, rows)
     return rows
+
+
+def append_detail_benchmark(target, detail_root, output_csv):
+    row = benchmark_row(target, detail_root)
+    append_csv(output_csv, row)
+    return row
