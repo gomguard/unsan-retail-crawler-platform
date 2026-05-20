@@ -25,11 +25,7 @@ backup/
 .claude/
 *.zip
 ~$*
-references/*_sample.html
-references/*_curl_*.txt
-lowes/references/*_curl_*.txt
-references/*.xlsx
-lowes/references/*.xlsx
+
 
 # Python
 __pycache__/
