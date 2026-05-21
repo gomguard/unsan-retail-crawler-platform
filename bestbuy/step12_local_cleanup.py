@@ -10,7 +10,7 @@ from .step00_config import DEFAULT_BESTBUY_RUNS_BASE, bestbuy_category, bestbuy_
 CATEGORY = bestbuy_category().lower()
 RUN_DATE = bestbuy_run_date()
 CATEGORY_ROOT = DEFAULT_BESTBUY_RUNS_BASE / CATEGORY
-RUN_ROOT = Path(os.getenv("BESTBUY_RUN_ROOT", CATEGORY_ROOT / RUN_DATE))
+RUN_ROOT = CATEGORY_ROOT / RUN_DATE
 
 LOCAL_RETENTION_DAYS = max(0, int(os.getenv("LOCAL_RETENTION_DAYS", "7") or 7))
 LOCAL_CLEANUP_DRY_RUN = os.getenv("LOCAL_CLEANUP_DRY_RUN", "0").strip().lower() in {

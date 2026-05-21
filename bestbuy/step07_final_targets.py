@@ -335,10 +335,6 @@ def batch_id_from_datetime(value):
 
 
 def page_type(row):
-    if CATEGORY == "HHP":
-        value = str(row.get("page_type") or "").strip().lower()
-        if value in {"main", "bsr", "trend"}:
-            return value
     return "bsr" if row.get("target_source") == "bsr_only_backfill" else "main"
 
 
@@ -405,6 +401,9 @@ def product_list_fields():
             "main_page_number",
             "bsr_page_number",
             "promotion_position",
+            "sku_id",
+            "category_key",
+            "final_target_rank",
         ]
     return [
         "account_name",
