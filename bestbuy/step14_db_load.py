@@ -1,6 +1,5 @@
 import csv
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -57,12 +56,8 @@ def normalize_value(value, data_type):
         return None
     data_type = str(data_type or "").lower()
     if data_type in {"integer", "bigint", "smallint"}:
-        text = str(value).replace(",", "").strip()
-        match = re.search(r"-?\d+", text)
-        if not match:
-            return None
         try:
-            return int(match.group(0))
+            return int(str(value).replace(",", "").strip())
         except ValueError:
             return None
     return value

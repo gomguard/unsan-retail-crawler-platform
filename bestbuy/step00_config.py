@@ -19,7 +19,7 @@ TARGET_URL_TABLE = os.getenv("BESTBUY_TARGET_URL_TABLE", "dx_target_page_url")
 OUTPUT_TABLE_REGISTRY = os.getenv("COMMON_OUTPUT_TABLE_REGISTRY", "public.common_setting_step02_output_table")
 
 BESTBUY_OUTPUT_TABLES = {
-    "TV": "tv_retail_com",
+    "TV": "tv_retail_com_bby_v2_test",
     "HHP": "hhp_retail_com_bby_v2_test",
     "REF": "ref_retail_com_bby",
     "LDY": "ldy_retail_com_bby",
