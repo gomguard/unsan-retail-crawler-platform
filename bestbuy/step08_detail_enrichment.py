@@ -3,6 +3,7 @@ import html
 import json
 import os
 import re
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -22,6 +23,8 @@ from .step00_config import (
     apply_bestbuy_location,
     bestbuy_category,
     bestbuy_output_table,
+    bestbuy_store_id,
+    bestbuy_zip_code,
     db_config,
     old_pdp_url,
     rel_path,
@@ -58,55 +61,41 @@ FINAL_OUTPUT_CSV = Path(os.getenv("BESTBUY_FINAL_OUTPUT_CSV", OUTPUT_ROOT / "fin
 MANIFEST_PATH = DETAIL_ROOT / "manifest_detail_enrichment.json"
 FETCH_COMPARE = os.getenv("BESTBUY_DETAIL_FETCH_COMPARE", "0").lower() in {"1", "true", "yes", "y"}
 RUN_BATCH_ID = os.getenv("BESTBUY_BATCH_ID") or f"b_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+BATCH_FETCH = os.getenv("BESTBUY_DETAIL_BATCH_FETCH", "0").lower() in {"1", "true", "yes", "y"}
+BATCH_SIZE = max(1, int(os.getenv("BESTBUY_DETAIL_BATCH_SIZE", "25")))
 
 HHP_FINAL_FIELDS = [
-    "id",
-    "country",
-    "product",
     "item",
     "account_name",
     "page_type",
+    "product",
     "count_of_reviews",
     "retailer_sku_name",
     "product_url",
     "star_rating",
     "count_of_star_ratings",
-    "sku_popularity",
     "final_sku_price",
     "original_sku_price",
     "savings",
-    "discount_type",
     "offer",
-    "bundle",
     "pick_up_availability",
     "fastest_delivery",
-    "delivery_availability",
-    "shipping_info",
-    "available_quantity_for_purchase",
-    "inventory_status",
     "sku_status",
-    "retailer_membership_discounts",
     "trade_in",
     "hhp_storage",
     "hhp_color",
     "hhp_carrier",
-    "detailed_review_content",
-    "summarized_review_content",
-    "top_mentions",
     "recommendation_intent",
     "main_rank",
     "bsr_rank",
-    "rank_1",
-    "rank_2",
     "trend_rank",
-    "number_of_ppl_purchased_yesterday",
-    "number_of_ppl_added_to_carts",
-    "number_of_units_purchased_past_month",
     "retailer_sku_name_similar",
     "promotion_type",
     "calendar_week",
     "crawl_strdatetime",
     "batch_id",
+    "country",
+    "detailed_review_content",
 ]
 
 FALLBACK_FINAL_FIELDS = {
@@ -209,7 +198,27 @@ def hhp_attributes_from_product(product, product_name):
             if value:
                 attrs[field] = clean_hhp_carrier(value) if field == "hhp_carrier" else compact_text(value)
                 break
+    storage = (
+        spec_value([product], "Internal Storage")
+        or spec_value([product], "Storage Capacity")
+        or spec_value([product], "Built-In Storage")
+        or spec_value([product], "Total Storage Capacity")
+    )
+    if storage:
+        attrs["hhp_storage"] = compact_text(storage)
     return attrs
+
+
+def output_product_value(target):
+    category = (target.get("category_key") or CATEGORY).strip().upper()
+    return "HHP" if category == "HHP" else category.lower()
+
+
+def output_page_type(target):
+    value = str(target.get("page_type") or "").strip().lower()
+    if value in {"main", "bsr", "promotion", "trend"}:
+        return value
+    return "bsr" if target.get("target_source") == "bsr_only_backfill" else "main"
 
 
 def money(value):
@@ -517,6 +526,19 @@ def existing_detail_dirs(sku):
     )
 
 
+def remove_stale_fail_dirs(existing, desired, raw_root):
+    if not desired or not str(desired.name).endswith("_success"):
+        return
+    raw_root = raw_root.resolve()
+    for old_dir in existing:
+        if old_dir == desired or not old_dir.name.endswith("_fail"):
+            continue
+        resolved = old_dir.resolve()
+        if raw_root == resolved or raw_root not in resolved.parents:
+            continue
+        shutil.rmtree(resolved, ignore_errors=True)
+
+
 def legacy_detail_paths(sku):
     return {
         "html": RAW_DETAIL_DIR / f"{sku}.html",
@@ -545,7 +567,12 @@ def detail_folder(sku, target=None, status=None):
                         new_file = desired / old_file.name
                         if not new_file.exists():
                             old_file.rename(new_file)
+                    try:
+                        old_dir.rmdir()
+                    except OSError:
+                        pass
         desired.mkdir(parents=True, exist_ok=True)
+        remove_stale_fail_dirs(existing_detail_dirs(sku), desired, RAW_DETAIL_DIR)
         return desired
     if existing:
         return existing[0]
@@ -586,7 +613,12 @@ def review_folder(sku, target=None, status=None):
                         new_file = desired / old_file.name
                         if not new_file.exists():
                             old_file.rename(new_file)
+                    try:
+                        old_dir.rmdir()
+                    except OSError:
+                        pass
         desired.mkdir(parents=True, exist_ok=True)
+        remove_stale_fail_dirs(existing_review_dirs(sku), desired, RAW_REVIEW_DIR)
         return desired
     if existing:
         return existing[0]
@@ -627,7 +659,12 @@ def compare_folder(sku, target=None, status=None):
                         new_file = desired / old_file.name
                         if not new_file.exists():
                             old_file.rename(new_file)
+                    try:
+                        old_dir.rmdir()
+                    except OSError:
+                        pass
         desired.mkdir(parents=True, exist_ok=True)
+        remove_stale_fail_dirs(existing_compare_dirs(sku), desired, RAW_COMPARE_DIR)
         return desired
     if existing:
         return existing[0]
@@ -801,7 +838,7 @@ def write_detail_artifacts(paths, html_text, headers):
 def detail_success(sku):
     paths = detail_paths(sku)
     meta = read_json(paths["meta"])
-    if meta.get("success") is True and paths["html"].exists():
+    if meta.get("success") is True and (paths["apollo"].exists() or paths["html"].exists()):
         return True
     return False
 
@@ -934,6 +971,326 @@ def review20_payload(html_text):
     return payload
 
 
+DETAIL_PRODUCT_QUERY = """
+query BestBuyDetailGraphqlOnly(
+  $skuId: String!
+  $fulfillmentInput: ProductFulfillmentInput!
+  $productPriceInput: ProductItemPriceInput!
+  $placement: String!
+  $site: String!
+  $limit: Int!
+) {
+  productBySkuId(skuId: $skuId) {
+    skuId
+    bsin
+    brand
+    name { short }
+    url { pdp relativePdp skuSpecificUrl }
+    color { displayName }
+    reviewInfo {
+      averageRating
+      reviewCount
+      recommendedPercent
+      reviewSummary
+      conFeatures { name }
+      proFeatures { name }
+      syndicatedReviewSummary { clientDisplayName overallRating totalReviewCount }
+    }
+    price(input: $productPriceInput) {
+      displayableCustomerPrice
+      displayableRegularPrice
+      customerPrice
+      currentPrice
+      regularPrice
+      totalSavings
+      totalSavingsPercent
+      preferredBadging
+      puckDisplayMessage
+    }
+    specificationGroups { name specifications { definition displayName value } }
+    productVariationDetailDisplay {
+      productVariations {
+        shortName
+        color
+        colorCategory
+        sku
+        variations { rawName value }
+      }
+    }
+    fulfillmentOptions(input: $fulfillmentInput) {
+      buttonStates { buttonState displayText secondaryButtonState secondaryDisplayText }
+      ispuDetails {
+        ispuAvailability {
+          pickupEligible
+          maxDate
+          fulfillDate
+          promiseByStreetDate
+        }
+      }
+      deliveryDetails {
+        deliveryAvailability {
+          deliveryEligible
+          deliverySlots { date }
+        }
+      }
+      shippingDetails {
+        shippingAvailability {
+          shippingEligible
+          promiseByStreetDate
+          defaultCustomerLosGroupId
+          customerLOSGroup {
+            customerLosGroupId
+            minLineItemMaxDate
+            maxLineItemMaxDate
+            price
+          }
+        }
+      }
+    }
+    operationalAttributes { values }
+    badgesV2 { badgeId label type description }
+    badges { displayName typeCode }
+    offers { offers { offerId offerType hotOffer complexMemberOffer } }
+    buyingOptions { type description pdpUrl skuId }
+    isConstrainedHighVelocity
+    isPurchaseWithTradeInEligible
+    connectionType { code }
+    openBoxCondition
+  }
+  versionedJsonByKey(key: "trade-in-call-to-action") { json }
+  recommendations(filter: {placement: $placement, site: $site, limit: $limit, skus: [$skuId]}) {
+    subPlacements {
+      recommendations {
+        item {
+          ... on Product {
+            skuId
+            name { short }
+            url { relativePdp }
+            reviewInfo { averageRating reviewCount }
+            specificationGroups { name specifications { definition displayName value } }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def detail_product_payload(sku):
+    zip_code = str(bestbuy_zip_code())
+    store_id = str(bestbuy_store_id())
+    return {
+        "operationName": "BestBuyDetailGraphqlOnly",
+        "variables": {
+            "skuId": str(sku),
+            "fulfillmentInput": {
+                "shipping": {"destinationZipCode": zip_code, "effectivePlanPaidMembership": "NULL"},
+                "delivery": {
+                    "destinationZipCode": zip_code,
+                    "deliveryDateOption": "EARLIEST_AVAILABLE_DATE",
+                    "effectivePlanPaidMembership": "NULL",
+                },
+                "inStorePickup": {"storeId": store_id, "searchNearby": True, "showNearbyLocations": False},
+                "profileCode": None,
+                "buttonState": {
+                    "fulfillmentOption": None,
+                    "context": "PDP",
+                    "destinationZipCode": zip_code,
+                    "storeId": store_id,
+                    "effectivePlanPaidMembership": "NULL",
+                },
+            },
+            "productPriceInput": {
+                "customerAttributes": "",
+                "salesChannel": "LargeView",
+                "customerId": None,
+                "planPaidMemberType": "NULL",
+                "ct": "",
+                "isStoreAgent": False,
+                "locationId": "",
+            },
+            "placement": "single-compare",
+            "site": "dotcom-l",
+            "limit": 3,
+        },
+        "extensions": {"clientLibrary": {"name": "@apollo/client", "version": "4.1.6"}},
+        "query": DETAIL_PRODUCT_QUERY,
+    }
+
+
+def batch_graphql_inputs():
+    zip_code = str(bestbuy_zip_code())
+    store_id = str(bestbuy_store_id())
+    fulfillment_input = (
+        f'{{shipping:{{destinationZipCode:"{zip_code}",effectivePlanPaidMembership:"NULL"}},'
+        f'delivery:{{destinationZipCode:"{zip_code}",deliveryDateOption:EARLIEST_AVAILABLE_DATE,effectivePlanPaidMembership:"NULL"}},'
+        f'inStorePickup:{{storeId:"{store_id}",searchNearby:true,showNearbyLocations:false}},'
+        f'profileCode:null,'
+        f'buttonState:{{fulfillmentOption:null,context:PDP,destinationZipCode:"{zip_code}",storeId:"{store_id}",effectivePlanPaidMembership:"NULL"}}}}'
+    )
+    price_input = (
+        '{customerAttributes:"",salesChannel:"LargeView",customerId:null,'
+        'planPaidMemberType:"NULL",ct:"",isStoreAgent:false,locationId:""}'
+    )
+    return fulfillment_input, price_input
+
+
+def batch_product_block(alias, sku, fulfillment_input, price_input):
+    return f'''
+  {alias}: productBySkuId(skuId: "{sku}") {{
+    skuId
+    bsin
+    brand
+    name {{ short }}
+    url {{ pdp relativePdp skuSpecificUrl }}
+    color {{ displayName }}
+    reviewInfo {{
+      averageRating
+      reviewCount
+      recommendedPercent
+      reviewSummary
+      conFeatures {{ name }}
+      proFeatures {{ name }}
+      syndicatedReviewSummary {{ clientDisplayName overallRating totalReviewCount }}
+    }}
+    reviews(filter: {{page: 1, pageSize: 20, sortBy: BEST_MATCH}}) {{
+      results {{ rating title text userNickname submissionTime }}
+    }}
+    price(input: {price_input}) {{
+      displayableCustomerPrice
+      displayableRegularPrice
+      customerPrice
+      currentPrice
+      regularPrice
+      totalSavings
+      totalSavingsPercent
+      preferredBadging
+      puckDisplayMessage
+    }}
+    specificationGroups {{ name specifications {{ definition displayName value }} }}
+    productVariationDetailDisplay {{
+      productVariations {{
+        shortName
+        color
+        colorCategory
+        sku
+        variations {{ rawName value }}
+      }}
+    }}
+    fulfillmentOptions(input: {fulfillment_input}) {{
+      buttonStates {{ buttonState displayText secondaryButtonState secondaryDisplayText }}
+      ispuDetails {{
+        ispuAvailability {{
+          pickupEligible
+          maxDate
+          fulfillDate
+          promiseByStreetDate
+        }}
+      }}
+      deliveryDetails {{
+        deliveryAvailability {{
+          deliveryEligible
+          deliverySlots {{ date }}
+        }}
+      }}
+      shippingDetails {{
+        shippingAvailability {{
+          shippingEligible
+          promiseByStreetDate
+          defaultCustomerLosGroupId
+          customerLOSGroup {{
+            customerLosGroupId
+            minLineItemMaxDate
+            maxLineItemMaxDate
+            price
+          }}
+        }}
+      }}
+    }}
+    operationalAttributes {{ values }}
+    badgesV2 {{ badgeId label type description }}
+    badges {{ displayName typeCode }}
+    offers {{ offers {{ offerId offerType hotOffer complexMemberOffer }} }}
+    buyingOptions {{ type description pdpUrl skuId }}
+    isConstrainedHighVelocity
+    isPurchaseWithTradeInEligible
+    connectionType {{ code }}
+    openBoxCondition
+  }}'''
+
+
+def batch_recommendations_block(alias, sku):
+    return f'''
+  {alias}: recommendations(filter: {{placement: "single-compare", site: "dotcom-l", limit: 3, skus: ["{sku}"]}}) {{
+    subPlacements {{
+      recommendations {{
+        item {{
+          ... on Product {{
+            description {{ long }}
+            name {{ short }}
+            primaryImage {{ piscesHref }}
+            reviewInfo {{ averageRating reviewCount conFeatures {{ name }} proFeatures {{ name }} }}
+            specificationGroups {{ name specifications {{ definition displayName value }} }}
+            url {{ relativePdp }}
+            skuId
+            openBoxCondition
+          }}
+        }}
+      }}
+    }}
+  }}'''
+
+
+def detail_review_compare_batch_payload(skus):
+    fulfillment_input, price_input = batch_graphql_inputs()
+    chunks = ['  tradeInContent: versionedJsonByKey(key: "trade-in-call-to-action") { json }']
+    for index, sku in enumerate(skus):
+        chunks.append(batch_product_block(f"p{index}", sku, fulfillment_input, price_input))
+        if FETCH_COMPARE:
+            chunks.append(batch_recommendations_block(f"r{index}", sku))
+    return {
+        "operationName": "BestBuyDetailReviewCompareBatch",
+        "variables": {},
+        "extensions": {"clientLibrary": {"name": "@apollo/client", "version": "4.1.6"}},
+        "query": "query BestBuyDetailReviewCompareBatch {\n" + "\n".join(chunks) + "\n}",
+    }
+
+
+def apollo_events_from_graphql_response(response_json):
+    return [
+        {
+            "events": [
+                {
+                    "type": "next",
+                    "value": {"data": response_json.get("data", {}) if isinstance(response_json, dict) else {}},
+                }
+            ]
+        }
+    ]
+
+
+REVIEW20_QUERY = """
+query BestBuyReview20GraphqlOnly($skuId: String!) {
+  productBySkuId(skuId: $skuId) {
+    skuId
+    reviews(filter: {page: 1, pageSize: 20, sortBy: BEST_MATCH}) {
+      results { rating title text userNickname submissionTime }
+    }
+  }
+}
+""".strip()
+
+
+def review20_direct_payload(sku):
+    return {
+        "operationName": "BestBuyReview20GraphqlOnly",
+        "variables": {"skuId": str(sku)},
+        "extensions": {"clientLibrary": {"name": "@apollo/client", "version": "4.1.6"}},
+        "query": REVIEW20_QUERY,
+    }
+
+
 COMPARE_PRODUCT_QUERY = """
 query GetCompareProduct($placement: String!, $site: String!, $limit: Int!, $skuId: String!) {
   productBySkuId(skuId: $skuId) {
@@ -987,6 +1344,204 @@ def compare_product_payload(sku):
     }
 
 
+def chunked(items, size):
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
+
+
+def batch_response_for_product(response_json, alias):
+    data = response_json.get("data") if isinstance(response_json, dict) else {}
+    product = data.get(alias) if isinstance(data, dict) else None
+    return {"data": {"productBySkuId": product}} if isinstance(product, dict) else {}
+
+
+def batch_response_for_compare(response_json, product_alias, recommendation_alias):
+    data = response_json.get("data") if isinstance(response_json, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    product = data.get(product_alias)
+    recommendations = data.get(recommendation_alias)
+    out = {"data": {}}
+    if isinstance(product, dict):
+        out["data"]["productBySkuId"] = product
+    if isinstance(recommendations, dict):
+        out["data"]["recommendations"] = recommendations
+    return out
+
+
+def write_batch_detail_result(target, sku, response_json, headers, request_payload, base_meta):
+    product_alias = base_meta["product_alias"]
+    single_json = batch_response_for_product(response_json, product_alias)
+    product = ((single_json.get("data") or {}).get("productBySkuId") or {})
+    success = isinstance(product, dict) and str(product.get("skuId") or "") == str(sku)
+    paths = detail_paths_for_status(sku, target, success)
+    paths["apollo"].write_text(
+        json.dumps(apollo_events_from_graphql_response(single_json), ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    paths["headers"].write_text(json.dumps(headers, indent=2, ensure_ascii=False), encoding="utf-8")
+    if paths["html"].exists():
+        paths["html"].unlink()
+    meta = {
+        "sku_id": sku,
+        "stage": "detail",
+        "url": target_url(target, sku),
+        "attempt": base_meta["attempt"],
+        "started_at": base_meta["started_at"],
+        "success": success,
+        "status_code": base_meta["status_code"],
+        "transport": base_meta["transport"],
+        "fetch_mode": FETCH_MODE,
+        "batch_fetch": True,
+        "batch_size": base_meta["batch_size"],
+        "elapsed_seconds": base_meta["elapsed_seconds"],
+        "x_request_cost": base_meta["x_request_cost"],
+        "bytes": base_meta["bytes"],
+        "stored_bytes": 0,
+        "html_mode": "graphql_only",
+        "apollo_payload_count": 1 if single_json else 0,
+        "finished_at": base_meta["finished_at"],
+        "error": "" if success else (base_meta.get("error") or "detail_graphql_missing_product"),
+    }
+    paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return meta
+
+
+def write_batch_review_result(target, sku, response_json, headers, request_payload, base_meta):
+    product_alias = base_meta["product_alias"]
+    single_json = batch_response_for_product(response_json, product_alias)
+    review_count = review_result_count_from_json(single_json)
+    success = review_count is not None
+    paths = review_paths_for_status(sku, target, success)
+    paths["response_json"].write_text(json.dumps(single_json, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["response_txt"].write_text(json.dumps(single_json, ensure_ascii=False), encoding="utf-8", errors="replace")
+    paths["headers"].write_text(json.dumps(headers, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["request"].write_text(json.dumps(request_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    meta = {
+        "sku_id": sku,
+        "stage": "review20",
+        "url": target_url(target, sku),
+        "attempt": base_meta["attempt"],
+        "started_at": base_meta["started_at"],
+        "success": success,
+        "status_code": base_meta["status_code"],
+        "transport": base_meta["transport"],
+        "fetch_mode": FETCH_MODE,
+        "batch_fetch": True,
+        "batch_size": base_meta["batch_size"],
+        "elapsed_seconds": base_meta["elapsed_seconds"],
+        "x_request_cost": 0,
+        "bytes": len(json.dumps(single_json, ensure_ascii=False)),
+        "review_count_returned": review_count if review_count is not None else 0,
+        "finished_at": base_meta["finished_at"],
+        "error": "" if success else (base_meta.get("error") or "review20_missing_results"),
+    }
+    paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return meta
+
+
+def write_batch_compare_result(target, sku, response_json, headers, request_payload, base_meta):
+    product_alias = base_meta["product_alias"]
+    recommendation_alias = base_meta["recommendation_alias"]
+    single_json = batch_response_for_compare(response_json, product_alias, recommendation_alias)
+    data = single_json.get("data") if isinstance(single_json, dict) else {}
+    recommendations = first_path([data], ["recommendations", "subPlacements", 0, "recommendations"]) or []
+    success = isinstance(data, dict) and isinstance(recommendations, list)
+    paths = compare_paths_for_status(sku, target, success)
+    paths["response_json"].write_text(json.dumps(single_json, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["response_txt"].write_text(json.dumps(single_json, ensure_ascii=False), encoding="utf-8", errors="replace")
+    paths["headers"].write_text(json.dumps(headers, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["request"].write_text(json.dumps(request_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    meta = {
+        "sku_id": sku,
+        "stage": "compare",
+        "url": target_url(target, sku),
+        "attempt": base_meta["attempt"],
+        "started_at": base_meta["started_at"],
+        "success": success,
+        "status_code": base_meta["status_code"],
+        "transport": base_meta["transport"],
+        "fetch_mode": FETCH_MODE,
+        "batch_fetch": True,
+        "batch_size": base_meta["batch_size"],
+        "elapsed_seconds": base_meta["elapsed_seconds"],
+        "x_request_cost": 0,
+        "bytes": len(json.dumps(single_json, ensure_ascii=False)),
+        "recommendation_count": len(recommendations) if isinstance(recommendations, list) else 0,
+        "finished_at": base_meta["finished_at"],
+        "error": "" if success else (base_meta.get("error") or "compare_recommendations_missing"),
+    }
+    paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return meta
+
+
+def fetch_detail_review_compare_batch(client, batch_targets):
+    skus = [str(target.get("sku_id") or "").strip() for target in batch_targets]
+    payload = detail_review_compare_batch_payload(skus)
+    started = now()
+    for transport in fetch_transports():
+        if transport == "zenrows" and not client:
+            continue
+        start = time.perf_counter()
+        try:
+            response = client.post(
+                "https://www.bestbuy.com/gateway/graphql",
+                params=graphql_params(),
+                headers={
+                    "accept": "application/json, text/plain, */*",
+                    "content-type": "application/json",
+                    "origin": "https://www.bestbuy.com",
+                    "referer": target_url(batch_targets[0], skus[0]) if batch_targets else "https://www.bestbuy.com/",
+                },
+                data=json.dumps(payload),
+                timeout=REQUEST_TIMEOUT,
+            )
+            elapsed = round(time.perf_counter() - start, 3)
+            response_json = {}
+            error = ""
+            try:
+                response_json = response.json()
+                if response_json.get("errors"):
+                    error = json.dumps(response_json.get("errors"), ensure_ascii=False, separators=(",", ":"))
+            except ValueError as exc:
+                error = str(exc)
+            if response.status_code != 200 or not isinstance(response_json.get("data"), dict):
+                return [], request_cost(response.headers), error or "batch_graphql_missing_data"
+            cost = request_cost(response.headers)
+            per_sku_cost = round(cost / max(len(skus), 1), 7)
+            results = []
+            finished = now()
+            headers = dict(response.headers)
+            for index, target in enumerate(batch_targets):
+                sku = skus[index]
+                base_meta = {
+                    "attempt": next_attempt(detail_paths(sku)["meta"], target_url(target, sku)),
+                    "started_at": started,
+                    "finished_at": finished,
+                    "status_code": response.status_code,
+                    "transport": transport,
+                    "batch_size": len(batch_targets),
+                    "elapsed_seconds": elapsed,
+                    "x_request_cost": per_sku_cost,
+                    "bytes": len(response.text or ""),
+                    "error": error,
+                    "product_alias": f"p{index}",
+                    "recommendation_alias": f"r{index}",
+                }
+                dmeta = write_batch_detail_result(target, sku, response_json, headers, payload, base_meta)
+                rmeta = read_json(review_paths(sku)["meta"])
+                cmeta = compare_meta(sku)
+                if review20_required_for_target(target, sku) and not review_success(sku):
+                    rmeta = write_batch_review_result(target, sku, response_json, headers, payload, base_meta)
+                if FETCH_COMPARE and dmeta.get("success") and not compare_success(sku):
+                    cmeta = write_batch_compare_result(target, sku, response_json, headers, payload, base_meta)
+                results.append((sku, dmeta, rmeta, cmeta))
+            return results, cost, ""
+        except RequestException as exc:
+            return [], 0.0, str(exc)
+    return [], 0.0, "no_available_transport"
+
+
 def detail_payloads(sku):
     paths = detail_paths(sku)
     if paths.get("apollo") and paths["apollo"].exists():
@@ -1002,6 +1557,8 @@ def detail_payloads(sku):
 
 
 def review20_payload_for_sku(sku):
+    if os.getenv("BESTBUY_GRAPHQL_ONLY", "0").lower() in {"1", "true", "yes", "y"}:
+        return review20_direct_payload(sku)
     payload = find_started_operation_from_payloads(detail_payloads(sku), "ProductSchema_init")
     if not payload:
         return None
@@ -1092,8 +1649,7 @@ def fetch_review20(client, target):
         meta.update({"success": False, "error": "ProductSchema_init not found", "finished_at": now()})
         paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         return meta
-    paths = review_paths_for_status(sku, target, False)
-    paths["request"].write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths = current_paths
 
     for transport in fetch_transports():
         if transport == "zenrows" and not client:
@@ -1173,7 +1729,27 @@ def fetch_review20(client, target):
 
 def compare_success(sku):
     meta = read_json(compare_paths(sku)["meta"])
-    return bool(meta.get("success"))
+    return bool(meta.get("success")) or bool(compare_data_from_detail_payloads(sku))
+
+
+def compare_meta(sku):
+    meta = read_json(compare_paths(sku)["meta"])
+    if meta.get("success"):
+        return meta
+    if compare_data_from_detail_payloads(sku):
+        return {
+            "sku_id": sku,
+            "stage": "compare",
+            "success": True,
+            "attempt": 0,
+            "status_code": "HTML",
+            "transport": "detail_html",
+            "fetch_mode": FETCH_MODE,
+            "x_request_cost": 0,
+            "error": "",
+            "source": "detail_apollo",
+        }
+    return meta
 
 
 def fetch_compare(client, target):
@@ -1191,8 +1767,7 @@ def fetch_compare(client, target):
         return meta
 
     payload = compare_product_payload(sku)
-    paths = compare_paths_for_status(sku, target, False)
-    paths["request"].write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths = current_paths
 
     for transport in fetch_transports():
         if transport == "zenrows" and not client:
@@ -1406,6 +1981,33 @@ def best_price(products):
     return best
 
 
+def visible_regular_price(price, target):
+    regular = price.get("displayableRegularPrice") or price.get("regularPrice") or target.get("regular_price")
+    customer = price.get("displayableCustomerPrice") or price.get("customerPrice") or target.get("customer_price")
+    savings = price.get("totalSavings") or target.get("total_savings")
+    try:
+        savings_number = float(str(savings).replace("$", "").replace(",", ""))
+    except (TypeError, ValueError):
+        savings_number = None
+    if savings_number is not None and savings_number <= 0:
+        return ""
+    if regular not in (None, "") and customer not in (None, ""):
+        if money(regular) == money(customer):
+            return ""
+    return regular
+
+
+def visible_savings(price, target):
+    savings = price.get("totalSavings") or target.get("total_savings")
+    try:
+        savings_number = float(str(savings).replace("$", "").replace(",", ""))
+    except (TypeError, ValueError):
+        savings_number = None
+    if savings_number is not None and savings_number <= 0:
+        return ""
+    return savings
+
+
 def spec_value(products, display_name):
     for product in reversed(products):
         for group in product.get("specificationGroups") or []:
@@ -1421,6 +2023,60 @@ def offer_count(products):
         return str(len(offers))
     buying = first_value(products, "buyingOptions") or []
     return str(len(buying)) if buying else ""
+
+
+def badge_labels(products):
+    labels = []
+    for product in products:
+        for badge in product.get("badgesV2") or []:
+            label = compact_text((badge or {}).get("label") or (badge or {}).get("description"))
+            if label and label not in labels:
+                labels.append(label)
+        for badge in product.get("badges") or []:
+            label = compact_text((badge or {}).get("displayName"))
+            if label and label not in labels:
+                labels.append(label)
+        price = product.get("price") or {}
+        for key in ("preferredBadging", "puckDisplayMessage"):
+            label = compact_text(price.get(key))
+            if label and label not in labels:
+                labels.append(label)
+    return labels
+
+
+def trade_in_text_from_detail_payloads(sku, products):
+    eligible = any(product.get("isPurchaseWithTradeInEligible") for product in products if isinstance(product, dict))
+    content = {}
+    for payload in detail_payloads(sku):
+        for event in payload.get("events", []):
+            data = event_data(event)
+            if not isinstance(data, dict):
+                continue
+            versioned = data.get("versionedJsonByKey") or {}
+            json_value = versioned.get("json") if isinstance(versioned, dict) else {}
+            if isinstance(json_value, dict):
+                content = json_value
+                break
+        if content:
+            break
+    if not eligible and not content:
+        return ""
+
+    text = json.dumps(content, ensure_ascii=False) if content else ""
+    amount_match = re.search(r"\$\s?[\d,]+(?:\.\d{2})?", text)
+    if amount_match:
+        return f"Check your trade-in value.Save up to {amount_match.group(0).replace(' ', '')} when you trade in a similar device."
+    return "Check your trade-in value.Save when you trade in a similar device." if eligible or content else ""
+
+
+def promotion_type_from_products(products, trade_in=""):
+    values = []
+    if trade_in:
+        values.append("Trade-in offer")
+    for label in badge_labels(products):
+        if label and label not in values:
+            values.append(label)
+    return " ||| ".join(values)
 
 
 def recommendation(products):
@@ -1610,9 +2266,8 @@ def sample_fields():
 
 def output_row(target):
     sku = str(target.get("sku_id") or "").strip()
-    detail_html_path = detail_paths(sku)["html"]
-    html_text = detail_html_path.read_text(encoding="utf-8", errors="replace") if detail_html_path.exists() else ""
-    selector_values = detail_selector_values(html_text)
+    html_text = ""
+    selector_values = {}
     products = products_from_detail(sku)
     compare_similar_names = compare_similar_names_from_detail(sku)
     price = best_price(products)
@@ -1634,14 +2289,16 @@ def output_row(target):
     bsin = first_value(products, "bsin") or target.get("bsin", "")
     primary_product = products[-1] if products else {}
     hhp_attrs = hhp_attributes_from_product(primary_product, product_name) if CATEGORY == "HHP" else {}
+    trade_in = trade_in_text_from_detail_payloads(sku, products) if CATEGORY == "HHP" else ""
+    promotion_type = first_non_empty(target.get("promotion_type", ""), promotion_type_from_products(products, trade_in))
 
     crawl_dt = datetime.now()
     row = {
         "id": "",
-        "product": (target.get("category_key") or CATEGORY).lower(),
+        "product": output_product_value(target),
         "item": bsin,
         "account_name": "Bestbuy",
-        "page_type": "bsr" if target.get("target_source") == "bsr_only_backfill" else "main",
+        "page_type": output_page_type(target),
         "count_of_reviews": "0" if external_reviews else int_commas(review_info.get("reviewCount") or target.get("review_count")),
         "retailer_sku_name": first_non_empty(product_name, selector_values.get("retailer_sku_name")),
         "product_url": product_url,
@@ -1665,50 +2322,38 @@ def output_row(target):
             selector_values.get("final_sku_price_no_longer_available"),
         ),
         "original_sku_price": first_non_empty(
-            money(price.get("displayableRegularPrice") or price.get("regularPrice") or target.get("regular_price")),
+            money(visible_regular_price(price, target)),
             selector_values.get("original_sku_price"),
         ),
         "savings": first_non_empty(
-            money_int(price.get("totalSavings") or target.get("total_savings")),
+            money_int(visible_savings(price, target)),
             selector_values.get("savings"),
         ),
         "offer": first_non_empty(target.get("offer"), target.get("offer_count")),
         "pick_up_availability": first_non_empty(
             target.get("pick_up_availability"),
-            selector_values.get("pick_up_availability"),
             pickup_text(pickup),
         ),
         "fastest_delivery": first_non_empty(
             target.get("fastest_delivery"),
-            selector_values.get("fastest_delivery"),
             fastest_delivery_text(best_shipping_availability(products)),
-            fastest_delivery_from_html(html_text),
         ),
         "delivery_availability": first_non_empty(
             target.get("delivery_availability"),
-            selector_values.get("delivery_availability"),
             delivery_text(delivery),
-            delivery_from_html(html_text),
             date_to_relative_or_phrase("Delivery as soon as", delivery_slot),
         ),
         "shipping_info": "",
         "sku_status": "Sponsored" if target.get("is_sponsored") in {"1", "true", "True"} else "",
+        "trade_in": trade_in,
         "hhp_storage": hhp_attrs.get("hhp_storage", ""),
         "hhp_color": hhp_attrs.get("hhp_color", ""),
         "hhp_carrier": hhp_attrs.get("hhp_carrier", ""),
         "detailed_review_content": "" if external_reviews else review20_content(sku),
-        "summarized_review_content": "",
-        "top_mentions": "",
         "recommendation_intent": ""
         if external_reviews
         else recommendation_intent_value(
             review_count,
-            selector_values.get("recommendation_intent"),
-            selector_values.get("reviewpage_recommendation_intent_fallback"),
-            selector_values.get("reviewpage_recommendation_intent_fallback2"),
-            selector_values.get("reviewpage_recommendation_intent_fallback3"),
-            selector_values.get("reviewpage_recommendation_intent_fallback4"),
-            recommendation_from_html(html_text),
             recommended_percent_from_detail(sku),
             recommendation(products),
         ),
@@ -1718,7 +2363,7 @@ def output_row(target):
         "trend_rank": target.get("trend_rank", ""),
         "retailer_sku_name_similar": " ||| ".join(compare_similar_names[:4]),
         "estimated_annual_electricity_use": clean_energy(energy),
-        "promotion_type": target.get("promotion_type", ""),
+        "promotion_type": promotion_type,
         "calendar_week": f"w{crawl_dt.isocalendar().week}",
         "crawl_datetime": crawl_dt.strftime("%Y-%m-%d %H:%M"),
         "crawl_strdatetime": crawl_dt.strftime("%Y-%m-%d %H:%M"),
@@ -1726,8 +2371,6 @@ def output_row(target):
         "batch_id": RUN_BATCH_ID,
         "country": "SEA",
     }
-    for field, value in selector_values.items():
-        row.setdefault(field, value)
     return row
 
 
@@ -1738,7 +2381,7 @@ def build_outputs(targets):
         sku = str(target.get("sku_id") or "").strip()
         dmeta = read_json(detail_paths(sku)["meta"])
         rmeta = read_json(review_paths(sku)["meta"])
-        cmeta = read_json(compare_paths(sku)["meta"])
+        cmeta = compare_meta(sku)
         rows.append(output_row(target))
         if not dmeta.get("success"):
             failures.append(
@@ -1839,10 +2482,10 @@ def main():
             rmeta = read_json(review_paths(sku)["meta"])
         if FETCH_COMPARE and STAGE in {"all", "detail"}:
             should_fetch_compare = can_fetch_network and dmeta.get("success") and not compare_success(sku)
-            cmeta = fetch_compare(client, target) if should_fetch_compare else read_json(compare_paths(sku)["meta"])
+            cmeta = fetch_compare(client, target) if should_fetch_compare else compare_meta(sku)
             fetched_compare = bool(should_fetch_compare)
         else:
-            cmeta = read_json(compare_paths(sku)["meta"])
+            cmeta = compare_meta(sku)
         with benchmark_lock:
             append_detail_benchmark(target, DETAIL_ROOT, DETAIL_BENCHMARKS_CSV)
         return index, sku, dmeta, rmeta, cmeta, fetched_detail, fetched_review, fetched_compare
@@ -1850,9 +2493,42 @@ def main():
     detail_cost = 0.0
     review_cost = 0.0
     compare_cost = 0.0
+    batch_processed = set()
     if REBUILD_ONLY:
         print(f"rebuild_only=1 output_targets={len(output_targets)}")
-    elif WORKERS > 1 and len(targets) > 1:
+    elif BATCH_FETCH and can_fetch_network and targets:
+        for batch_targets in chunked(targets, BATCH_SIZE):
+            results, batch_cost, batch_error = fetch_detail_review_compare_batch(client, batch_targets)
+            if batch_cost:
+                detail_cost += batch_cost
+            result_map = {sku: (dmeta, rmeta, cmeta) for sku, dmeta, rmeta, cmeta in results}
+            for target in batch_targets:
+                sku = str(target.get("sku_id") or "").strip()
+                dmeta, rmeta, cmeta = result_map.get(
+                    sku,
+                    (
+                        read_json(detail_paths(sku)["meta"]),
+                        read_json(review_paths(sku)["meta"]),
+                        compare_meta(sku),
+                    ),
+                )
+                if dmeta.get("success"):
+                    batch_processed.add(sku)
+                with benchmark_lock:
+                    append_detail_benchmark(target, DETAIL_ROOT, DETAIL_BENCHMARKS_CSV)
+                print(
+                    f"[batch {len(batch_processed)}/{len(targets)}] sku={sku} "
+                    f"detail={dmeta.get('success')} attempt={dmeta.get('attempt')} "
+                    f"compare={cmeta.get('success')} attempt={cmeta.get('attempt')} "
+                    f"review={rmeta.get('success')} attempt={rmeta.get('attempt')} "
+                    f"reviews={rmeta.get('review_count_returned', '')}"
+                    + (f" batch_error={batch_error}" if batch_error and sku not in result_map else "")
+                )
+        targets = [target for target in targets if str(target.get("sku_id") or "").strip() not in batch_processed]
+        if targets:
+            print(f"batch fallback sku_count={len(targets)}")
+
+    if not REBUILD_ONLY and WORKERS > 1 and len(targets) > 1:
         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
             futures = [executor.submit(process_target, index, target) for index, target in enumerate(targets, 1)]
             for future in as_completed(futures):
@@ -1870,7 +2546,7 @@ def main():
                     f"review={rmeta.get('success')} attempt={rmeta.get('attempt')} "
                     f"reviews={rmeta.get('review_count_returned', '')}"
                 )
-    else:
+    elif not REBUILD_ONLY:
         for index, target in enumerate(targets, 1):
             index, sku, dmeta, rmeta, cmeta, fetched_detail, fetched_review, fetched_compare = process_target(index, target)
             if fetched_detail:

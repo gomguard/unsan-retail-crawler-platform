@@ -1,5 +1,7 @@
 import csv
 import json
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -15,11 +17,12 @@ from .step00_config import (
 
 TARGET_SCHEMA = "public"
 CATEGORY = bestbuy_category()
-RUN_ROOT = Path(DEFAULT_BESTBUY_RUN_ROOT)
+RUN_ROOT = Path(os.getenv("BESTBUY_RUN_ROOT", DEFAULT_BESTBUY_RUN_ROOT))
 OUTPUT_ROOT = RUN_ROOT / "output"
 FINAL_OUTPUT_CSV = OUTPUT_ROOT / "final_output.csv"
 PRODUCT_LIST_CSV = OUTPUT_ROOT / "bestbuy_product_list.csv"
 MANIFEST_PATH = OUTPUT_ROOT / "db_load_manifest.json"
+DB_LOAD_DRY_RUN = os.getenv("DB_LOAD_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 
 def now():
@@ -33,7 +36,7 @@ def quote_ident(value):
 def read_csv(path):
     path = Path(path)
     if not path.exists():
-        return []
+        raise RuntimeError(f"CSV not found: {path}")
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
 
@@ -56,8 +59,12 @@ def normalize_value(value, data_type):
         return None
     data_type = str(data_type or "").lower()
     if data_type in {"integer", "bigint", "smallint"}:
+        text = str(value).replace(",", "").strip()
+        match = re.search(r"-?\d+", text)
+        if not match:
+            return None
         try:
-            return int(str(value).replace(",", "").strip())
+            return int(match.group(0))
         except ValueError:
             return None
     return value
@@ -104,6 +111,8 @@ def insert_rows(cur, table_name, columns, rows):
 
 def load_one(cur, csv_path, table_name):
     rows = read_csv(csv_path)
+    if not rows:
+        raise RuntimeError(f"CSV has no data rows: {csv_path}")
     columns = table_columns(cur, table_name)
     if not columns:
         raise RuntimeError(f"DB table not found or has no columns: {TARGET_SCHEMA}.{table_name}")
@@ -118,16 +127,43 @@ def load_one(cur, csv_path, table_name):
     return result
 
 
+def planned_load(csv_path, table_name):
+    rows = read_csv(csv_path)
+    if not rows:
+        raise RuntimeError(f"CSV has no data rows: {csv_path}")
+    return {
+        "csv": rel_path(csv_path),
+        "table": f"{TARGET_SCHEMA}.{table_name}",
+        "csv_rows": len(rows),
+        "columns_in_csv": list(rows[0].keys()),
+    }
+
+
 def main():
     import psycopg2
 
     started_at = now()
     config = db_config()
+    final_table = bestbuy_output_table(CATEGORY)
+    product_list_table = bestbuy_product_list_table(CATEGORY)
+
+    if DB_LOAD_DRY_RUN:
+        manifest = {
+            "run_type": "step14_db_load",
+            "dry_run": True,
+            "started_at": started_at,
+            "finished_at": now(),
+            "category": CATEGORY,
+            "run_root": rel_path(RUN_ROOT),
+            "final_output": planned_load(FINAL_OUTPUT_CSV, final_table),
+            "product_list": planned_load(PRODUCT_LIST_CSV, product_list_table),
+        }
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
+        return
+
     if not config:
         raise RuntimeError("DB_CONFIG is missing")
 
-    final_table = bestbuy_output_table(CATEGORY)
-    product_list_table = bestbuy_product_list_table(CATEGORY)
     conn = psycopg2.connect(
         host=config.get("host"),
         port=int(config.get("port") or 5432),

@@ -89,11 +89,19 @@ STEPS = [
         8,
         "detail_html",
         "bestbuy.step08_detail_enrichment",
-        {"BESTBUY_DETAIL_STAGE": "detail", "BESTBUY_DETAIL_FETCH_COMPARE": "0", "ZENROWS_TIMEOUT": "240"},
         {
             "BESTBUY_DETAIL_STAGE": "detail",
             "BESTBUY_DETAIL_FETCH_COMPARE": "0",
+            "BESTBUY_DETAIL_BATCH_FETCH": "0",
+            "BESTBUY_SAVE_HTML_MODE": "slim",
+            "ZENROWS_TIMEOUT": "240",
+        },
+        {
+            "BESTBUY_DETAIL_STAGE": "detail",
+            "BESTBUY_DETAIL_FETCH_COMPARE": "0",
+            "BESTBUY_DETAIL_BATCH_FETCH": "0",
             "BESTBUY_DETAIL_RETRY_ONLY": "1",
+            "BESTBUY_SAVE_HTML_MODE": "slim",
             "ZENROWS_TIMEOUT": "240",
         },
     ),
@@ -101,8 +109,8 @@ STEPS = [
         9,
         "review20",
         "bestbuy.step09_review20",
-        {"ZENROWS_TIMEOUT": "240"},
-        {"BESTBUY_DETAIL_RETRY_ONLY": "1", "ZENROWS_TIMEOUT": "240"},
+        {"BESTBUY_GRAPHQL_ONLY": "0", "ZENROWS_TIMEOUT": "240"},
+        {"BESTBUY_DETAIL_RETRY_ONLY": "1", "BESTBUY_GRAPHQL_ONLY": "0", "ZENROWS_TIMEOUT": "240"},
     ),
     Step(10, "status_check", "bestbuy.step10_status_check"),
     Step(11, "s3_sync", "bestbuy.step11_s3_sync"),
@@ -166,6 +174,32 @@ def csv_stage_count(path, stage):
             if str(row.get("stage") or "").strip() == stage:
                 count += 1
     return count
+
+
+def csv_skus(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    skus = []
+    seen = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            sku = str(row.get("sku_id") or "").strip()
+            if sku and sku not in seen:
+                seen.add(sku)
+                skus.append(sku)
+    return skus
+
+
+def meta_success_for_sku(raw_dir, sku):
+    sku = str(sku or "").strip()
+    if not sku:
+        return False
+    raw_dir = Path(raw_dir)
+    for path in raw_dir.glob(f"*_{sku}_*/{sku}_meta.json"):
+        if read_json(path).get("success") is True:
+            return True
+    return read_json(raw_dir / f"{sku}_meta.json").get("success") is True
 
 
 def expected_pages(step):
@@ -237,17 +271,17 @@ def final_targets_complete():
     return True, f"target unique {count}"
 
 
-def detail_html_complete():
+def detail_complete():
     root = run_root()
     target_csv = root / "output" / "bestbuy_final_targets.csv"
-    target_count = csv_unique_count(target_csv, "sku_id")
-    detail_meta = list((root / "detail" / "raw" / "detail_html").rglob("*_meta.json"))
-    detail_success = sum(1 for path in detail_meta if read_json(path).get("success") is True)
-    if target_count <= 0:
+    target_skus = csv_skus(target_csv)
+    detail_dir = root / "detail" / "raw" / "detail_html"
+    if not target_skus:
         return False, "missing final targets"
-    if detail_success < target_count:
-        return False, f"detail {detail_success}/{target_count}"
-    return True, f"detail {detail_success}/{target_count}"
+    detail_success = sum(1 for sku in target_skus if meta_success_for_sku(detail_dir, sku))
+    if detail_success < len(target_skus):
+        return False, f"detail {detail_success}/{len(target_skus)}"
+    return True, f"detail {detail_success}/{len(target_skus)}"
 
 
 def review20_complete():
@@ -277,7 +311,7 @@ def step_complete(step):
     if step.name == "final_targets":
         return final_targets_complete()
     if step.name == "detail_html":
-        return detail_html_complete()
+        return detail_complete()
     if step.name == "review20":
         return review20_complete()
     if step.name == "status_check":
@@ -313,10 +347,10 @@ def run_step(step, dry_run=False, resume=False):
 
     env = os.environ.copy()
     for key, value in step.env.items():
-        env.setdefault(key, value)
+        env[key] = value
     if resume:
         for key, value in step.resume_env.items():
-            env.setdefault(key, value)
+            env[key] = value
     command = [PYTHON, "-m", step.module]
     print(f"[run] step {step.key} {step.name}: {' '.join(command)}")
     effective_env = {key: env.get(key, value) for key, value in step.env.items()}
