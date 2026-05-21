@@ -63,7 +63,10 @@ def build_sponsored_payload(skus):
         "query AdTech_NinjaCarousel_SkuDataQuery{"
         f"batch0:productsBySkuIds(skuIds:[{quoted_skus}])"
         "{...on Product{skuId name{short}primaryImage{href piscesHref altText}"
-        "...ReviewStats_Fragment url{skuSpecificUrl relativePdp}}}}"
+        "...ReviewStats_Fragment url{skuSpecificUrl relativePdp pdp}"
+        "price(input:{salesChannel:\"LargeView\",usePriceWithCart:true})"
+        "{displayableCustomerPrice customerPrice displayableRegularPrice regularPrice "
+        "totalSavings totalSavingsPercent giftSkus{skuId quantity}}}}}"
     )
     return {
         "operationName": "AdTech_NinjaCarousel_SkuDataQuery",

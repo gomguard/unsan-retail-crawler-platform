@@ -7,11 +7,12 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
-from requests import RequestException, Session
+from requests import RequestException
 from zenrows import ZenRowsClient
 
 from .step00_config import (
     DEFAULT_BESTBUY_RUN_ROOT,
+    apply_bestbuy_location,
     bestbuy_category,
     load_initial_urls,
     rel_path,
@@ -27,8 +28,14 @@ GRAPHQL_ENDPOINT = os.getenv("BESTBUY_GRAPHQL_ENDPOINT", "https://www.bestbuy.co
 SEARCH_SORT = os.getenv("BESTBUY_SEARCH_SORT", "")
 SEARCH_PAGES = int(os.getenv("BESTBUY_MAIN_PAGES", "13"))
 ORGANIC_OFFSET = int(os.getenv("BESTBUY_MAIN_ORGANIC_OFFSET", "18"))
+INCLUDE_SPONSORED_CAROUSEL = os.getenv("BESTBUY_INCLUDE_SPONSORED_CAROUSEL", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "120"))
-FETCH_MODE = os.getenv("BESTBUY_FETCH_MODE", os.getenv("BESTBUY_GRAPHQL_FETCH_MODE", "direct")).strip().lower()
+FETCH_MODE = os.getenv("BESTBUY_FETCH_MODE", os.getenv("BESTBUY_GRAPHQL_FETCH_MODE", "zenrows")).strip().lower()
 RUN_DATE = os.getenv("BESTBUY_RUN_DATE", datetime.now().strftime("%Y%m%d"))
 RUN_ID = os.getenv("BESTBUY_MAIN_RUN_ID", "main")
 RUN_ROOT = Path(os.getenv("BESTBUY_RUN_ROOT", DEFAULT_BESTBUY_RUN_ROOT)) / RUN_ID
@@ -98,6 +105,7 @@ def prepare_product_list_payload(operation, page):
     variables.setdefault("paginationForDetailedProductSearch", {})
     variables["paginationForDetailedProductSearch"]["pageNumber"] = page
     variables["paginationForDetailedProductSearch"]["offset"] = ORGANIC_OFFSET
+    apply_bestbuy_location(variables)
 
     query = operation["query"]
     if os.getenv("BESTBUY_SANITIZE_PRODUCT_LIST_QUERY", "0").lower() in {"1", "true", "yes"}:
@@ -123,31 +131,10 @@ def zenrows_params():
     return params
 
 
-def graphql_headers(page):
-    headers = {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": os.getenv("BESTBUY_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
-        "content-type": "application/json",
-        "origin": BESTBUY_BASE_URL,
-        "referer": build_search_url(page),
-        "user-agent": os.getenv(
-            "BESTBUY_USER_AGENT",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        ),
-    }
-    cookie = os.getenv("BESTBUY_COOKIE", "").strip()
-    if cookie:
-        headers["cookie"] = cookie
-    return headers
-
-
 def fetch_transports():
     if FETCH_MODE in {"zenrows", "zr"}:
         return ["zenrows"]
-    if FETCH_MODE in {"auto", "direct_first", "fallback"}:
-        return ["direct", "zenrows"]
-    return ["direct"]
+    raise RuntimeError("Best Buy listing collection is ZenRows GraphQL only. Set BESTBUY_FETCH_MODE=zenrows.")
 
 
 def post_graphql(client, payload, page, transport):
@@ -159,21 +146,13 @@ def post_graphql(client, payload, page, transport):
     }
     start = time.perf_counter()
     started_at = now()
-    if transport == "zenrows":
-        response = client.post(
-            GRAPHQL_ENDPOINT,
-            params=zenrows_params(),
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=REQUEST_TIMEOUT,
-        )
-    else:
-        response = Session().post(
-            GRAPHQL_ENDPOINT,
-            headers=graphql_headers(page),
-            data=json.dumps(payload),
-            timeout=REQUEST_TIMEOUT,
-        )
+    response = client.post(
+        GRAPHQL_ENDPOINT,
+        params=zenrows_params(),
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=REQUEST_TIMEOUT,
+    )
     elapsed = time.perf_counter() - start
     return response, started_at, now(), round(elapsed, 3), transport
 
@@ -387,7 +366,7 @@ def parse_page_rows(page, response_json):
                             },
                         )
                     )
-            elif placement_name == "SEARCH_SPONSORED_CAROUSEL_DEFAULT":
+            elif placement_name == "SEARCH_SPONSORED_CAROUSEL_DEFAULT" and INCLUDE_SPONSORED_CAROUSEL:
                 documents = placement.get("documents", [])
                 if not isinstance(documents, list):
                     continue
@@ -451,16 +430,28 @@ def write_csv(path, rows):
         "ad_source",
         "sku_id",
         "bsin",
+        "item",
         "brand",
         "product_name",
+        "retailer_sku_name",
         "product_url",
         "image_url",
         "rating",
         "review_count",
+        "star_rating",
+        "count_of_star_ratings",
+        "sku_status",
         "customer_price",
         "regular_price",
         "total_savings",
+        "final_sku_price",
+        "original_sku_price",
+        "savings",
         "total_savings_percent",
+        "fastest_delivery",
+        "delivery_availability",
+        "pick_up_availability",
+        "offer",
         "shipping_eligible",
         "pickup_eligible",
         "offer_count",
@@ -514,7 +505,7 @@ def page_summary(page, rows, meta, response_json):
 def main():
     api_key = os.getenv("ZENROWS_API_KEY")
     needs_zenrows = any(item == "zenrows" for item in fetch_transports())
-    if needs_zenrows and not api_key and FETCH_MODE in {"zenrows", "zr"}:
+    if needs_zenrows and not api_key:
         raise RuntimeError("Set ZENROWS_API_KEY in .env")
     make_dirs()
     run_started_at = now()

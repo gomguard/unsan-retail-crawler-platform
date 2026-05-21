@@ -158,6 +158,72 @@ def run_one(client, html_text, placement):
     }
 
 
+def run_batch(client, html_text, placements):
+    payloads = [find_started_operation_for_placement(html_text, placement) for placement in placements]
+
+    start = time.perf_counter()
+    response = client.post(
+        ENDPOINT,
+        params={
+            "custom_headers": "true",
+            "premium_proxy": "true",
+            "proxy_country": "us",
+            "js_render": "true",
+        },
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": "https://www.bestbuy.com",
+            "referer": REFERER,
+        },
+        data=json.dumps(payloads),
+        timeout=REQUEST_TIMEOUT,
+    )
+    elapsed = round(time.perf_counter() - start, 3)
+    text = response.text
+    status = "success" if response.status_code == 200 else "fail"
+    paths = placement_artifact_paths("all_batch", status)
+    paths["request"].write_text(json.dumps(payloads, indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["response"].write_text(text, encoding="utf-8", errors="replace")
+    paths["headers"].write_text(json.dumps(dict(response.headers), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    parse_error = ""
+    response_json = None
+    try:
+        response_json = response.json()
+        paths["json"].write_text(
+            json.dumps(response_json, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except ValueError as exc:
+        parse_error = str(exc)
+
+    response_items = response_json if isinstance(response_json, list) else []
+    all_rows = []
+    summaries = []
+    for index, placement in enumerate(placements):
+        item_json = response_items[index] if index < len(response_items) and isinstance(response_items[index], dict) else {}
+        rows = extract_rows_from_response(item_json, placement)
+        all_rows.extend(rows)
+        summaries.append(
+            {
+                "started_at": now(),
+                "placement": placement,
+                "promotion_type": PROMOTION_LABELS.get(placement, placement),
+                "status_code": response.status_code,
+                "elapsed_seconds": elapsed,
+                "x_request_cost": response.headers.get("x-request-cost", ""),
+                "bytes": len(text or ""),
+                "parse_error": parse_error,
+                "row_count": len(rows),
+                "artifact_folder": rel_path(paths["folder"]),
+                "response_json_path": rel_path(paths["json"]) if response_json is not None else "",
+                "batch_index": index,
+            }
+        )
+
+    return {"summaries": summaries, "rows": all_rows}
+
+
 def write_rows(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -199,12 +265,16 @@ def main():
     client = ZenRowsClient(api_key)
     placements = list(PROMOTION_LABELS) if PLACEMENT.lower() == "all" else [PLACEMENT]
 
-    all_rows = []
-    summaries = []
-    for placement in placements:
-        result = run_one(client, html_text, placement)
-        summaries.append(result["summary"])
-        all_rows.extend(result["rows"])
+    if PLACEMENT.lower() == "all":
+        result = run_batch(client, html_text, placements)
+        all_rows = result["rows"]
+        summaries = result["summaries"]
+        call_count = 1
+    else:
+        result = run_one(client, html_text, placements[0])
+        all_rows = result["rows"]
+        summaries = [result["summary"]]
+        call_count = 1
 
     slug = "all" if PLACEMENT.lower() == "all" else PLACEMENT
     out_csv = RUN_ROOT / "parsed" / f"{slug}_promotion_products.csv"
@@ -212,9 +282,13 @@ def main():
     summary = {
         "started_at": now(),
         "placements": placements,
-        "call_count": len(placements),
+        "call_count": call_count,
         "row_count": len(all_rows),
-        "total_x_request_cost": sum(float(s["x_request_cost"] or 0) for s in summaries),
+        "total_x_request_cost": (
+            float(summaries[0]["x_request_cost"] or 0)
+            if PLACEMENT.lower() == "all" and summaries
+            else sum(float(s["x_request_cost"] or 0) for s in summaries)
+        ),
         "summaries": summaries,
         "csv": rel_path(out_csv),
     }

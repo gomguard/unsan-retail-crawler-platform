@@ -119,6 +119,36 @@ def bestbuy_dated_run_root(run_date=None, category=None):
 DEFAULT_BESTBUY_RUN_ROOT = bestbuy_dated_run_root()
 
 
+def bestbuy_zip_code():
+    return os.getenv("BESTBUY_ZIP_CODE", "10010").strip() or "10010"
+
+
+def bestbuy_store_id():
+    return os.getenv("BESTBUY_STORE_ID", "482").strip() or "482"
+
+
+def apply_bestbuy_location(value, zip_code=None, store_id=None):
+    zip_code = str(zip_code or bestbuy_zip_code())
+    store_id = str(store_id or bestbuy_store_id())
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            if key in {
+                "destinationZipCode",
+                "preferredStoreZipCode",
+                "zipCode",
+                "postalCode",
+            }:
+                value[key] = zip_code
+            elif key in {"storeId", "locationId"}:
+                value[key] = store_id
+            else:
+                apply_bestbuy_location(item, zip_code=zip_code, store_id=store_id)
+    elif isinstance(value, list):
+        for item in value:
+            apply_bestbuy_location(item, zip_code=zip_code, store_id=store_id)
+    return value
+
+
 def _read_multiline_env_object(name):
     raw = os.getenv(name)
     if raw and raw.strip() not in {"{", ""}:

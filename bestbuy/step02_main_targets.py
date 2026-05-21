@@ -9,7 +9,7 @@ from requests import RequestException
 
 from .step00_config import DEFAULT_BESTBUY_RUN_ROOT, rel_path
 from .step00_parse_pdp import absolute_bestbuy_url, nested_get
-from .step00_parse_search import merge_dict
+from .step00_parse_search import listing_offer_count, merge_dict, money_text, price_value
 from .step00_sponsored_graphql import build_sponsored_payload, post_graphql, sponsored_product_map
 
 RUN_DATE = os.getenv("BESTBUY_RUN_DATE", datetime.now().strftime("%Y%m%d"))
@@ -47,10 +47,19 @@ def sponsored_skus(rows):
     for row in rows:
         if row.get("container_type") != "sponsored_ingrid":
             continue
+        if sponsored_row_has_listing_data(row):
+            continue
         sku = str(row.get("sku_id") or "").strip()
         if sku and sku not in skus:
             skus.append(sku)
     return skus
+
+
+def sponsored_row_has_listing_data(row):
+    return all(
+        str(row.get(key) or "").strip()
+        for key in ("product_name", "product_url", "customer_price", "rating")
+    )
 
 
 def fetch_sponsored_products(skus):
@@ -147,13 +156,54 @@ def enrich_sponsored_row(row, product):
     row["rating"] = row.get("rating") or review_info.get("averageRating", "")
     row["review_count"] = row.get("review_count") or review_info.get("reviewCount", "")
     row["is_reviewable"] = row.get("is_reviewable") or review_info.get("isReviewable", "")
+    row["retailer_sku_name"] = row.get("retailer_sku_name") or row.get("product_name", "")
+    row["star_rating"] = row.get("star_rating") or row.get("rating", "")
+    row["count_of_star_ratings"] = row.get("count_of_star_ratings") or row.get("review_count", "")
+
+    price = product.get("price", {}) if isinstance(product.get("price"), dict) else {}
+    row["customer_price"] = row.get("customer_price") or price_value(
+        price, "displayableCustomerPrice", "customerPrice"
+    )
+    row["regular_price"] = row.get("regular_price") or price_value(
+        price, "displayableRegularPrice", "regularPrice"
+    )
+    row["total_savings"] = row.get("total_savings") or price_value(price, "totalSavings")
+    row["total_savings_percent"] = row.get("total_savings_percent") or price_value(price, "totalSavingsPercent")
+    row["final_sku_price"] = row.get("final_sku_price") or money_text(row.get("customer_price"))
+    row["original_sku_price"] = row.get("original_sku_price") or money_text(row.get("regular_price"))
+    row["savings"] = row.get("savings") or money_text(row.get("total_savings"), drop_cents_for_whole=True)
+    row["offer"] = row.get("offer") or listing_offer_count(product)
+    row["offer_count"] = row.get("offer_count") or row.get("offer", "")
 
     try:
         raw_product = json.loads(row.get("raw_product_json") or "{}")
     except ValueError:
         raw_product = {}
     merge_dict(raw_product, product)
+    normalized_offer = listing_offer_count(raw_product)
+    if normalized_offer != "":
+        row["offer"] = normalized_offer
+        row["offer_count"] = normalized_offer
     row["raw_product_json"] = compact_json(raw_product)
+    return row
+
+
+def normalize_existing_listing_row(row):
+    row = dict(row)
+    try:
+        raw_product = json.loads(row.get("raw_product_json") or "{}")
+    except ValueError:
+        raw_product = {}
+    normalized_offer = listing_offer_count(raw_product)
+    if normalized_offer != "":
+        row["offer"] = normalized_offer
+        row["offer_count"] = normalized_offer
+    row["retailer_sku_name"] = row.get("retailer_sku_name") or row.get("product_name", "")
+    row["star_rating"] = row.get("star_rating") or row.get("rating", "")
+    row["count_of_star_ratings"] = row.get("count_of_star_ratings") or row.get("review_count", "")
+    row["final_sku_price"] = row.get("final_sku_price") or money_text(row.get("customer_price"))
+    row["original_sku_price"] = row.get("original_sku_price") or money_text(row.get("regular_price"))
+    row["savings"] = row.get("savings") or money_text(row.get("total_savings"), drop_cents_for_whole=True)
     return row
 
 
@@ -178,14 +228,22 @@ def write_csv(path, rows):
         "bsin",
         "brand",
         "product_name",
+        "retailer_sku_name",
         "product_url",
         "image_url",
         "rating",
         "review_count",
+        "star_rating",
+        "count_of_star_ratings",
+        "sku_status",
         "customer_price",
         "regular_price",
         "total_savings",
+        "final_sku_price",
+        "original_sku_price",
+        "savings",
         "total_savings_percent",
+        "offer",
         "offer_count",
     ]
     fieldnames = [key for key in preferred if key in keys]
@@ -204,6 +262,7 @@ def main():
     products, calls = fetch_sponsored_products(skus) if skus else ({}, [])
     enriched = []
     for row in target_rows:
+        row = normalize_existing_listing_row(row)
         if row.get("container_type") == "sponsored_ingrid":
             row = enrich_sponsored_row(row, products.get(str(row.get("sku_id"))))
         enriched.append(row)

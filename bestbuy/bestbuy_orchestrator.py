@@ -58,7 +58,7 @@ STEPS = [
         "bsr_list",
         "bestbuy.step03_bsr_list",
         {
-            "BESTBUY_MAIN_PAGES": "2",
+            "BESTBUY_MAIN_PAGES": "6",
             "BESTBUY_MAIN_RUN_ID": "bsr",
             "BESTBUY_MAIN_ORGANIC_OFFSET": "72",
             "BESTBUY_SEARCH_SORT": "Best-Selling",
@@ -89,8 +89,13 @@ STEPS = [
         8,
         "detail_html",
         "bestbuy.step08_detail_enrichment",
-        {"BESTBUY_DETAIL_STAGE": "detail", "ZENROWS_TIMEOUT": "240"},
-        {"BESTBUY_DETAIL_STAGE": "detail", "BESTBUY_DETAIL_RETRY_ONLY": "1", "ZENROWS_TIMEOUT": "240"},
+        {"BESTBUY_DETAIL_STAGE": "detail", "BESTBUY_DETAIL_FETCH_COMPARE": "0", "ZENROWS_TIMEOUT": "240"},
+        {
+            "BESTBUY_DETAIL_STAGE": "detail",
+            "BESTBUY_DETAIL_FETCH_COMPARE": "0",
+            "BESTBUY_DETAIL_RETRY_ONLY": "1",
+            "ZENROWS_TIMEOUT": "240",
+        },
     ),
     Step(
         9,
@@ -149,6 +154,18 @@ def csv_unique_count(path, key):
             if value:
                 seen.add(value)
     return len(seen)
+
+
+def csv_stage_count(path, stage):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if str(row.get("stage") or "").strip() == stage:
+                count += 1
+    return count
 
 
 def expected_pages(step):
@@ -238,13 +255,12 @@ def review20_complete():
     target_csv = root / "output" / "bestbuy_final_targets.csv"
     target_count = csv_unique_count(target_csv, "sku_id")
     output_count = csv_count(root / "output" / "final_output.csv")
-    review_meta = list((root / "detail" / "raw" / "review20").rglob("*_meta.json"))
-    review_success = sum(1 for path in review_meta if read_json(path).get("success") is True)
+    review_failures = csv_stage_count(root / "detail" / "parsed" / "detail_failures.csv", "review20")
     if target_count <= 0:
         return False, "missing final targets"
-    if output_count < target_count or review_success < target_count:
-        return False, f"output {output_count}/{target_count}, review {review_success}/{target_count}"
-    return True, f"output {output_count}/{target_count}, review {review_success}/{target_count}"
+    if output_count < target_count or review_failures:
+        return False, f"output {output_count}/{target_count}, review_failures {review_failures}"
+    return True, f"output {output_count}/{target_count}, review_failures {review_failures}"
 
 
 def step_complete(step):

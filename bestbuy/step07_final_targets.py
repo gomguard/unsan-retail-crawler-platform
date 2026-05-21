@@ -330,12 +330,18 @@ def calendar_week():
     return f"w{datetime.now().isocalendar().week}"
 
 
+def batch_id_from_datetime(value):
+    return f"b_{value.strftime('%Y%m%d_%H%M%S')}"
+
+
 def page_type(row):
     return "bsr" if row.get("target_source") == "bsr_only_backfill" else "main"
 
 
 def product_list_rows(rows, bsr_pages):
-    crawl_dt = datetime.now().strftime("%Y-%m-%d %H:%M")
+    crawl_dt_obj = datetime.now()
+    crawl_dt = crawl_dt_obj.strftime("%Y-%m-%d %H:%M")
+    batch_id = batch_id_from_datetime(crawl_dt_obj)
     output = []
     for row in rows:
         sku = str(row.get("sku_id") or "").strip()
@@ -354,7 +360,7 @@ def product_list_rows(rows, bsr_pages):
             "bsr_rank": row.get("bsr_rank", ""),
             "product_url": row.get("product_url", ""),
             "calendar_week": calendar_week(),
-            "batch_id": f"bestbuy_{RUN_DATE}",
+            "batch_id": batch_id,
             "main_page_number": row.get("page", "") if row.get("main_rank") else "",
             "bsr_page_number": bsr_pages.get(sku, ""),
             "sku_id": sku,

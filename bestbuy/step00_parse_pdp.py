@@ -35,6 +35,19 @@ def nested_get(value, path, default=""):
     return default if current is None else current
 
 
+def first_nested(value, path, default=""):
+    current = value
+    for key in path:
+        if isinstance(current, list):
+            current = current[0] if current else default
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key, default)
+    if isinstance(current, list):
+        current = current[0] if current else default
+    return default if current is None else current
+
+
 def absolute_bestbuy_url(path):
     if not path:
         return ""
@@ -159,8 +172,9 @@ def parse_product(product, source_html_path):
     primary_image = product.get("primaryImage", {}) if isinstance(product.get("primaryImage"), dict) else {}
     dimension = product.get("dimension", {}) if isinstance(product.get("dimension"), dict) else {}
     seller = product.get("seller", {}) if isinstance(product.get("seller"), dict) else {}
-    shipping = nested_get(product, ["fulfillmentOptions", "shippingDetails", "shippingAvailability"], {})
-    pickup = nested_get(product, ["fulfillmentOptions", "ispuDetails", "ispuAvailability"], {})
+    shipping = first_nested(product, ["fulfillmentOptions", "shippingDetails", "shippingAvailability"], {})
+    delivery = first_nested(product, ["fulfillmentOptions", "deliveryDetails", "deliveryAvailability"], {})
+    pickup = first_nested(product, ["fulfillmentOptions", "ispuDetails", "ispuAvailability"], {})
 
     row = {
         "source_html_path": str(source_html_path),
@@ -194,7 +208,11 @@ def parse_product(product, source_html_path):
         "badges": join_badges(product),
         "highlights": join_highlights(product),
         "shipping_eligible": shipping.get("shippingEligible", "") if isinstance(shipping, dict) else "",
+        "shipping_max_date": first_nested(shipping, ["customerLOSGroup", "maxLineItemMaxDate"]),
+        "delivery_eligible": delivery.get("deliveryEligible", "") if isinstance(delivery, dict) else "",
+        "delivery_date": first_nested(delivery, ["deliverySlots", "date"]),
         "pickup_eligible": pickup.get("pickupEligible", "") if isinstance(pickup, dict) else "",
+        "pickup_max_date": pickup.get("maxDate", "") if isinstance(pickup, dict) else "",
         "pickup_quantity": pickup.get("quantity", "") if isinstance(pickup, dict) else "",
         "images_json": compact_json(product.get("images")),
         "documents_json": compact_json(product.get("documents") or product.get("productManuals")),

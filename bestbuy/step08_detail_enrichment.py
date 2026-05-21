@@ -13,12 +13,13 @@ from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 from lxml import html as lxml_html
-from requests import RequestException, Session
+from requests import RequestException
 from zenrows import ZenRowsClient
 
 from .step00_config import (
     DEFAULT_BESTBUY_RUN_ROOT,
     KRW_PER_USD,
+    apply_bestbuy_location,
     bestbuy_category,
     bestbuy_output_table,
     db_config,
@@ -40,13 +41,14 @@ MAX_ATTEMPTS = int(os.getenv("BESTBUY_DETAIL_MAX_ATTEMPTS", "3"))
 RETRY_ONLY = os.getenv("BESTBUY_DETAIL_RETRY_ONLY", "0").lower() in {"1", "true", "yes", "y"}
 REBUILD_ONLY = os.getenv("BESTBUY_DETAIL_REBUILD_ONLY", "0").lower() in {"1", "true", "yes", "y"}
 REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "240"))
-FETCH_MODE = os.getenv("BESTBUY_FETCH_MODE", os.getenv("BESTBUY_DETAIL_FETCH_MODE", "direct")).strip().lower()
+FETCH_MODE = os.getenv("BESTBUY_FETCH_MODE", os.getenv("BESTBUY_DETAIL_FETCH_MODE", "zenrows")).strip().lower()
 WORKERS = int(os.getenv("BESTBUY_DETAIL_WORKERS", "1"))
 STAGE = os.getenv("BESTBUY_DETAIL_STAGE", "detail").lower()
 SAVE_HTML_MODE = os.getenv("BESTBUY_SAVE_HTML_MODE", "slim").lower()
 
 RAW_DETAIL_DIR = DETAIL_ROOT / "raw" / "detail_html"
 RAW_REVIEW_DIR = DETAIL_ROOT / "raw" / "review20"
+RAW_COMPARE_DIR = DETAIL_ROOT / "raw" / "compare"
 PARSED_DIR = DETAIL_ROOT / "parsed"
 BENCHMARKS_DIR = DETAIL_ROOT / "benchmarks"
 DETAIL_ROWS_CSV = PARSED_DIR / "detail_enriched_rows.csv"
@@ -54,6 +56,8 @@ FAILURES_CSV = PARSED_DIR / "detail_failures.csv"
 DETAIL_BENCHMARKS_CSV = BENCHMARKS_DIR / "detail_benchmarks.csv"
 FINAL_OUTPUT_CSV = Path(os.getenv("BESTBUY_FINAL_OUTPUT_CSV", OUTPUT_ROOT / "final_output.csv"))
 MANIFEST_PATH = DETAIL_ROOT / "manifest_detail_enrichment.json"
+FETCH_COMPARE = os.getenv("BESTBUY_DETAIL_FETCH_COMPARE", "0").lower() in {"1", "true", "yes", "y"}
+RUN_BATCH_ID = os.getenv("BESTBUY_BATCH_ID") or f"b_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 HHP_FINAL_FIELDS = [
     "id",
@@ -112,6 +116,10 @@ FALLBACK_FINAL_FIELDS = {
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
+
+
+def batch_id_from_datetime(value):
+    return f"b_{value.strftime('%Y%m%d_%H%M%S')}"
 
 
 def compact_text(value):
@@ -241,6 +249,22 @@ def date_to_phrase(prefix, date_value):
     return f"{prefix} {dt.strftime('%a, %b')} {dt.day}"
 
 
+def date_to_relative_or_phrase(prefix, date_value):
+    if not date_value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(date_value)[:10])
+    except ValueError:
+        return ""
+    today = datetime.now().date()
+    target = dt.date()
+    if target == today:
+        return f"{prefix} today"
+    if (target - today).days == 1:
+        return f"{prefix} tomorrow"
+    return f"{prefix} {dt.strftime('%a, %b')} {dt.day}"
+
+
 def html_match(pattern, html_text, flags=re.I | re.S):
     match = re.search(pattern, html_text, flags)
     return compact_text(match.group(1)) if match else ""
@@ -258,15 +282,18 @@ def recommendation_from_html(html_text):
 
 
 def fastest_delivery_from_html(html_text):
-    for pattern in (r'aria-label="(Get it by[^"]+)"', r'aria-label="(Shipping[^"]+)"'):
+    for pattern in (r'aria-label="(Get it[^"]+)"', r">\s*(Get it[^<]+)</"):
         value = html_match(pattern, html_text)
-        if value:
+        if value and value.lower().startswith("get"):
             return compact_text(value)
     return ""
 
 
 def delivery_from_html(html_text):
-    value = html_match(r'aria-label="(Delivery\s+As soon as[^"]+)"', html_text)
+    value = html_match(r'aria-label="(Delivery\s+As soon as[^"]+)"', html_text) or html_match(
+        r">\s*(Delivery\s+as soon as[^<]+)</",
+        html_text,
+    )
     return compact_text(value).replace("Delivery As soon as", "Delivery as soon as")
 
 
@@ -379,7 +406,11 @@ def recommendation_phrase(value):
     if "would recommend" in value:
         return value
     match = re.search(r"\d+%", value)
-    return f"{match.group(0)} would recommend to a friend" if match else value
+    if match:
+        return f"{match.group(0)} would recommend to a friend"
+    if re.fullmatch(r"\d+(?:\.\d+)?", value):
+        return f"{value}% would recommend to a friend"
+    return value
 
 
 def request_cost(headers):
@@ -404,6 +435,12 @@ def detail_params():
                 {"wait": 800},
                 {"scroll_y": 1800},
                 {"wait": 800},
+                {"scroll_y": 2200},
+                {"wait": 900},
+                {"scroll_y": 2200},
+                {"wait": 900},
+                {"scroll_y": 2200},
+                {"wait": 900},
                 {"wait": 1500},
             ]
         ),
@@ -422,32 +459,7 @@ def graphql_params():
 def fetch_transports():
     if FETCH_MODE in {"zenrows", "zr"}:
         return ["zenrows"]
-    if FETCH_MODE in {"auto", "direct_first", "fallback"}:
-        return ["direct", "zenrows"]
-    return ["direct"]
-
-
-def direct_headers(referer=None, json_request=False):
-    headers = {
-        "accept": "application/json, text/plain, */*" if json_request else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "accept-language": os.getenv("BESTBUY_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
-        "user-agent": os.getenv(
-            "BESTBUY_USER_AGENT",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        ),
-    }
-    if json_request:
-        headers["content-type"] = "application/json"
-        headers["origin"] = "https://www.bestbuy.com"
-    if referer:
-        headers["referer"] = referer
-    cookie = os.getenv("BESTBUY_COOKIE", "").strip()
-    if cookie:
-        headers["cookie"] = cookie
-    return headers
+    raise RuntimeError("Best Buy detail collection is ZenRows GraphQL only. Set BESTBUY_FETCH_MODE=zenrows.")
 
 
 def load_csv(path):
@@ -581,6 +593,47 @@ def review_folder(sku, target=None, status=None):
     return None
 
 
+def existing_compare_dirs(sku):
+    pattern = f"*_{safe_part(sku)}_*"
+    dirs = []
+    for path in RAW_COMPARE_DIR.glob(pattern):
+        if path.is_dir() and (path / f"{sku}_meta.json").exists():
+            dirs.append(path)
+    return sorted(
+        dirs,
+        key=lambda path: (
+            0 if path.name.endswith("_success") else 1 if path.name.endswith("_fail") else 2,
+            path.name,
+        ),
+    )
+
+
+def compare_folder(sku, target=None, status=None):
+    sku_part = safe_part(sku)
+    desired = None
+    if status:
+        desired = RAW_COMPARE_DIR / f"{detail_rank(target)}_{sku_part}_{safe_part(status)}"
+
+    existing = existing_compare_dirs(sku)
+    if desired:
+        if existing and desired not in existing:
+            if not desired.exists():
+                existing[0].rename(desired)
+            else:
+                for old_dir in existing:
+                    if old_dir == desired:
+                        continue
+                    for old_file in old_dir.iterdir():
+                        new_file = desired / old_file.name
+                        if not new_file.exists():
+                            old_file.rename(new_file)
+        desired.mkdir(parents=True, exist_ok=True)
+        return desired
+    if existing:
+        return existing[0]
+    return None
+
+
 def detail_paths(sku):
     folder = detail_folder(sku)
     if folder:
@@ -652,8 +705,42 @@ def review_paths_for_status(sku, target, success):
     }
 
 
+def compare_paths(sku):
+    folder = compare_folder(sku)
+    if folder:
+        return {
+            "request": folder / f"{sku}_request.json",
+            "response_txt": folder / f"{sku}_response.txt",
+            "response_json": folder / f"{sku}_response.json",
+            "headers": folder / f"{sku}_headers.json",
+            "meta": folder / f"{sku}_meta.json",
+        }
+    folder = RAW_COMPARE_DIR / f"na_{safe_part(sku)}_pending"
+    return {
+        "request": folder / f"{sku}_request.json",
+        "response_txt": folder / f"{sku}_response.txt",
+        "response_json": folder / f"{sku}_response.json",
+        "headers": folder / f"{sku}_headers.json",
+        "meta": folder / f"{sku}_meta.json",
+    }
+
+
+def compare_paths_for_status(sku, target, success):
+    folder = compare_folder(sku, target, "success" if success else "fail")
+    return {
+        "request": folder / f"{sku}_request.json",
+        "response_txt": folder / f"{sku}_response.txt",
+        "response_json": folder / f"{sku}_response.json",
+        "headers": folder / f"{sku}_headers.json",
+        "meta": folder / f"{sku}_meta.json",
+    }
+
+
 def target_url(target, sku):
     url = str(target.get("product_url") or "").strip()
+    # PDP URL fallback is intentionally disabled for sponsored enrichment.
+    # Sponsored rows should be resolved first via productsBySkuIds in step02.
+    # Keep this only as a last-resort detail/review fallback for explicit PDP runs.
     return url or old_pdp_url(sku)
 
 
@@ -771,13 +858,16 @@ def target_rows(apply_filters=True):
             unique = [
                 row
                 for row in unique
-                if detail_success(row["sku_id"]) and not review_success(row["sku_id"])
+                if detail_success(row["sku_id"])
+                and review20_required_for_target(row, row["sku_id"])
+                and not review_success(row["sku_id"])
             ]
         else:
             unique = [
                 row
                 for row in unique
-                if not detail_success(row["sku_id"]) or not review_success(row["sku_id"])
+                if not detail_success(row["sku_id"])
+                or (review20_required_for_target(row, row["sku_id"]) and not review_success(row["sku_id"]))
             ]
     if apply_filters and LIMIT:
         unique = unique[:LIMIT]
@@ -816,12 +906,85 @@ def find_started_operation_from_payloads(payloads, operation_name):
     return None
 
 
+def operation_name(event):
+    options = event.get("options", {}) if isinstance(event, dict) else {}
+    query = options.get("query") or ""
+    if not isinstance(query, str):
+        return ""
+    match = re.search(r"\bquery\s+([A-Za-z0-9_]+)", query)
+    return match.group(1) if match else ""
+
+
+def event_variables(event):
+    options = event.get("options", {}) if isinstance(event, dict) else {}
+    variables = options.get("variables") or {}
+    return variables if isinstance(variables, dict) else {}
+
+
+def product_short_name(product):
+    return ((product or {}).get("name") or {}).get("short") or ""
+
+
 def review20_payload(html_text):
     payload = find_started_operation(html_text, "ProductSchema_init")
     if not payload:
         return None
+    apply_bestbuy_location(payload.get("variables", {}))
     payload["query"] = payload["query"].replace("reviews(filter:{pageSize:5})", "reviews(filter:{pageSize:20})")
     return payload
+
+
+COMPARE_PRODUCT_QUERY = """
+query GetCompareProduct($placement: String!, $site: String!, $limit: Int!, $skuId: String!) {
+  productBySkuId(skuId: $skuId) {
+    description { long }
+    name { short }
+    primaryImage { piscesHref }
+    reviewInfo { averageRating reviewCount conFeatures { name } proFeatures { name } }
+    specificationGroups { name specifications { definition displayName value } }
+    url { relativePdp }
+    skuId
+    openBoxCondition
+  }
+  recommendations(filter: {placement: $placement, site: $site, limit: $limit, skus: [$skuId]}) {
+    subPlacements {
+      recommendations {
+        ep
+        id
+        item {
+          ... on Product {
+            description { long }
+            name { short }
+            primaryImage { piscesHref }
+            reviewInfo { averageRating reviewCount conFeatures { name } proFeatures { name } }
+            specificationGroups { name specifications { definition displayName value } }
+            url { relativePdp }
+            skuId
+            openBoxCondition
+          }
+        }
+      }
+      ep
+      id
+      name
+    }
+  }
+}
+""".strip()
+
+
+def compare_product_payload(sku):
+    return {
+        "operationName": "GetCompareProduct",
+        "variables": {
+            "placement": "single-compare",
+            "site": "dotcom-l",
+            "limit": 3,
+            "skuId": str(sku),
+        },
+        "extensions": {"clientLibrary": {"name": "@apollo/client", "version": "4.1.6"}},
+        "query": COMPARE_PRODUCT_QUERY,
+    }
 
 
 def detail_payloads(sku):
@@ -842,6 +1005,7 @@ def review20_payload_for_sku(sku):
     payload = find_started_operation_from_payloads(detail_payloads(sku), "ProductSchema_init")
     if not payload:
         return None
+    apply_bestbuy_location(payload.get("variables", {}))
     payload["query"] = payload["query"].replace("reviews(filter:{pageSize:5})", "reviews(filter:{pageSize:20})")
     return payload
 
@@ -866,10 +1030,7 @@ def fetch_detail(client, target):
             continue
         start = time.perf_counter()
         try:
-            if transport == "zenrows":
-                response = client.get(pdp_url, params=detail_params(), timeout=REQUEST_TIMEOUT)
-            else:
-                response = Session().get(pdp_url, headers=direct_headers(referer="https://www.bestbuy.com/"), timeout=REQUEST_TIMEOUT)
+            response = client.get(pdp_url, params=detail_params(), timeout=REQUEST_TIMEOUT)
             html_text = response.text
             status = response.status_code
             success = status == 200 and has_product_schema(html_text)
@@ -939,26 +1100,18 @@ def fetch_review20(client, target):
             continue
         start = time.perf_counter()
         try:
-            if transport == "zenrows":
-                response = client.post(
-                    "https://www.bestbuy.com/gateway/graphql",
-                    params=graphql_params(),
-                    headers={
-                        "accept": "application/json, text/plain, */*",
-                        "content-type": "application/json",
-                        "origin": "https://www.bestbuy.com",
-                        "referer": pdp_url,
-                    },
-                    data=json.dumps(payload),
-                    timeout=REQUEST_TIMEOUT,
-                )
-            else:
-                response = Session().post(
-                    "https://www.bestbuy.com/gateway/graphql",
-                    headers=direct_headers(referer=pdp_url, json_request=True),
-                    data=json.dumps(payload),
-                    timeout=REQUEST_TIMEOUT,
-                )
+            response = client.post(
+                "https://www.bestbuy.com/gateway/graphql",
+                params=graphql_params(),
+                headers={
+                    "accept": "application/json, text/plain, */*",
+                    "content-type": "application/json",
+                    "origin": "https://www.bestbuy.com",
+                    "referer": pdp_url,
+                },
+                data=json.dumps(payload),
+                timeout=REQUEST_TIMEOUT,
+            )
         except RequestException as exc:
             paths = review_paths_for_status(sku, target, False)
             meta.update(
@@ -1018,28 +1171,148 @@ def fetch_review20(client, target):
     return meta
 
 
+def compare_success(sku):
+    meta = read_json(compare_paths(sku)["meta"])
+    return bool(meta.get("success"))
+
+
+def fetch_compare(client, target):
+    sku = str(target.get("sku_id") or "").strip()
+    pdp_url = target_url(target, sku)
+    current_paths = compare_paths(sku)
+    if compare_success(sku):
+        return read_json(current_paths["meta"])
+    attempt = next_attempt(current_paths["meta"], pdp_url)
+    meta = {"sku_id": sku, "stage": "compare", "url": pdp_url, "attempt": attempt, "started_at": now()}
+    if attempt > MAX_ATTEMPTS:
+        paths = compare_paths_for_status(sku, target, False)
+        meta.update({"success": False, "error": "max_attempts_exceeded"})
+        paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        return meta
+
+    payload = compare_product_payload(sku)
+    paths = compare_paths_for_status(sku, target, False)
+    paths["request"].write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    for transport in fetch_transports():
+        if transport == "zenrows" and not client:
+            continue
+        start = time.perf_counter()
+        try:
+            response = client.post(
+                "https://www.bestbuy.com/gateway/graphql",
+                params=graphql_params(),
+                headers={
+                    "accept": "application/json, text/plain, */*",
+                    "content-type": "application/json",
+                    "origin": "https://www.bestbuy.com",
+                    "referer": pdp_url,
+                },
+                data=json.dumps(payload),
+                timeout=REQUEST_TIMEOUT,
+            )
+            text = response.text
+            response_json = {}
+            error = ""
+            try:
+                response_json = response.json()
+            except ValueError:
+                error = "invalid_json"
+            data = response_json.get("data") if isinstance(response_json, dict) else {}
+            recommendations = first_path([data], ["recommendations", "subPlacements", 0, "recommendations"]) or []
+            success = response.status_code == 200 and isinstance(data, dict) and isinstance(recommendations, list)
+            paths = compare_paths_for_status(sku, target, success)
+            paths["response_txt"].write_text(text, encoding="utf-8", errors="replace")
+            if response_json:
+                paths["response_json"].write_text(json.dumps(response_json, indent=2, ensure_ascii=False), encoding="utf-8")
+            paths["headers"].write_text(json.dumps(dict(response.headers), indent=2, ensure_ascii=False), encoding="utf-8")
+            paths["request"].write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            meta.update(
+                {
+                    "success": success,
+                    "status_code": response.status_code,
+                    "transport": transport,
+                    "fetch_mode": FETCH_MODE,
+                    "elapsed_seconds": round(time.perf_counter() - start, 3),
+                    "x_request_cost": request_cost(response.headers),
+                    "bytes": len(text or ""),
+                    "recommendation_count": len(recommendations) if isinstance(recommendations, list) else 0,
+                    "finished_at": now(),
+                    "error": "" if success else (error or "compare_recommendations_missing"),
+                }
+            )
+        except RequestException as exc:
+            paths = compare_paths_for_status(sku, target, False)
+            meta.update(
+                {
+                    "success": False,
+                    "status_code": "ERR",
+                    "transport": transport,
+                    "fetch_mode": FETCH_MODE,
+                    "elapsed_seconds": round(time.perf_counter() - start, 3),
+                    "x_request_cost": 0,
+                    "finished_at": now(),
+                    "error": str(exc),
+                }
+            )
+        if meta.get("success"):
+            break
+    paths["meta"].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return meta
+
+
 def products_from_detail(sku):
     products = []
-    variations = []
     for payload in detail_payloads(sku):
         for event in payload.get("events", []):
             data = event_data(event)
             product = data.get("productBySkuId") if isinstance(data, dict) else None
             if isinstance(product, dict) and str(product.get("skuId")) == str(sku):
                 products.append(product)
-            bsin_product = data.get("bsinProduct") if isinstance(data, dict) else None
-            if isinstance(bsin_product, dict):
-                variation_display = bsin_product.get("productVariationDetailDisplay") or {}
-                items = variation_display.get("productBsinVariations", []) or []
-                for item in items:
-                    name = (
-                        (((item.get("bsinProduct") or {}).get("featuredSKU") or {}).get("product") or {})
-                        .get("name", {})
-                        .get("short")
-                    )
-                    if name and name not in variations:
-                        variations.append(name)
-    return products, variations
+    return products
+
+
+def compare_similar_names_from_detail(sku):
+    paths = compare_paths(sku)
+    response_json = read_json(paths["response_json"])
+    data = response_json.get("data") if isinstance(response_json, dict) else {}
+    if not isinstance(data, dict) or not data:
+        data = compare_data_from_detail_payloads(sku)
+    if not isinstance(data, dict):
+        return []
+
+    names = []
+    current = data.get("productBySkuId")
+    current_name = product_short_name(current) if isinstance(current, dict) else ""
+    if current_name:
+        names.append(current_name)
+
+    subplacements = first_path([data], ["recommendations", "subPlacements"]) or []
+    for subplacement in subplacements:
+        for recommendation in subplacement.get("recommendations") or []:
+            item = recommendation.get("item") or {}
+            name = product_short_name(item)
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def compare_data_from_detail_payloads(sku):
+    for payload in detail_payloads(sku):
+        for event in payload.get("events", []):
+            data = event_data(event)
+            if not isinstance(data, dict):
+                continue
+            current = data.get("productBySkuId")
+            recommendations = data.get("recommendations")
+            if not isinstance(current, dict) or not isinstance(recommendations, dict):
+                continue
+            if str(current.get("skuId") or "") != str(sku):
+                continue
+            subplacements = recommendations.get("subPlacements")
+            if isinstance(subplacements, list):
+                return data
+    return {}
 
 
 def first_value(products, key):
@@ -1094,6 +1367,27 @@ def best_path(products, path, required_keys=()):
     return sorted(values, key=lambda item: item[0], reverse=True)[0][1] if values else {}
 
 
+def best_shipping_availability(products):
+    values = []
+    for product in products:
+        details = first_path([product], ["fulfillmentOptions", "shippingDetails"]) or []
+        for detail in details:
+            for shipping in detail.get("shippingAvailability") or []:
+                if not isinstance(shipping, dict) or not shipping.get("shippingEligible"):
+                    continue
+                groups = shipping.get("customerLOSGroup") or []
+                default_group_id = shipping.get("defaultCustomerLosGroupId")
+                score = 1
+                if groups:
+                    score += 1
+                if default_group_id not in (None, ""):
+                    score += 3
+                if any(isinstance(group, dict) and group.get("price") in (0, 0.0, "0", "0.0") for group in groups):
+                    score += 1
+                values.append((score, shipping))
+    return sorted(values, key=lambda item: item[0], reverse=True)[0][1] if values else {}
+
+
 def best_price(products):
     best = {}
     best_score = -1
@@ -1134,18 +1428,147 @@ def recommendation(products):
     return f"{value}% would recommend to a friend" if value not in ("", None) else ""
 
 
+def review_count_number(*values):
+    for value in values:
+        if value in ("", None):
+            continue
+        text = re.sub(r"[^0-9]", "", str(value))
+        if text:
+            return int(text)
+    return None
+
+
+def has_external_review_text(*values):
+    for value in values:
+        text = str(value or "")
+        if re.search(r"\breviews?\s+from\b", text, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def syndicated_review_summary(review_info):
+    if not isinstance(review_info, dict):
+        return {}
+    summary = review_info.get("syndicatedReviewSummary")
+    return summary if isinstance(summary, dict) else {}
+
+
+def is_external_review_source(target=None, review_info=None):
+    target = target or {}
+    summary = syndicated_review_summary(review_info)
+    if summary:
+        return True
+    return has_external_review_text(
+        target.get("count_of_reviews"),
+        target.get("review_count"),
+        target.get("count_of_star_ratings"),
+        target.get("rating"),
+    )
+
+
+def review20_required_for_target(target, sku=None):
+    if is_external_review_source(target):
+        return False
+    count = review_count_number(
+        target.get("count_of_reviews"),
+        target.get("review_count"),
+        target.get("count_of_star_ratings"),
+    )
+    if count is None and sku and detail_success(sku):
+        review_info = (first_value(products_from_detail(sku), "reviewInfo") or {})
+        if isinstance(review_info, dict):
+            if is_external_review_source(target, review_info):
+                return False
+            count = review_count_number(review_info.get("reviewCount"))
+    return count is None or count > 5
+
+
+def recommendation_intent_value(review_count, *values):
+    if review_count == 0:
+        return ""
+    return first_non_empty(*(recommendation_phrase(value) for value in values))
+
+
+def pickup_text(pickup):
+    if not isinstance(pickup, dict) or not pickup.get("pickupEligible"):
+        return ""
+    return date_to_relative_or_phrase("Pick up", pickup.get("maxDate") or pickup.get("fulfillDate") or pickup.get("promiseByStreetDate"))
+
+
+def delivery_text(delivery):
+    if not isinstance(delivery, dict) or not delivery.get("deliveryEligible"):
+        return ""
+    slots = delivery.get("deliverySlots") or delivery.get("installationSlots") or []
+    if isinstance(slots, list) and slots:
+        slot = slots[0] if isinstance(slots[0], dict) else {}
+        return date_to_relative_or_phrase("Delivery as soon as", slot.get("date"))
+    return ""
+
+
+def fastest_delivery_text(shipping):
+    if not isinstance(shipping, dict) or not shipping.get("shippingEligible"):
+        return ""
+    groups = shipping.get("customerLOSGroup") or []
+    if isinstance(groups, list) and groups:
+        group = groups[0] if isinstance(groups[0], dict) else {}
+        default_group_id = shipping.get("defaultCustomerLosGroupId")
+        for candidate in groups:
+            if not isinstance(candidate, dict):
+                continue
+            if default_group_id not in (None, "") and str(candidate.get("customerLosGroupId")) == str(default_group_id):
+                group = candidate
+                break
+        date_value = group.get("minLineItemMaxDate") or group.get("maxLineItemMaxDate")
+        phrase = date_to_relative_or_phrase("Get it", date_value)
+        if phrase:
+            if group.get("price") in (0, 0.0, "0", "0.0"):
+                phrase = f"{phrase} \u2022 FREE"
+            return phrase
+    return date_to_relative_or_phrase("Get it", shipping.get("promiseByStreetDate"))
+
+
 def review20_content(sku):
     path = review_paths(sku)["response_json"]
-    if not path.exists():
-        return ""
-    data = read_json(path)
-    reviews = (((data.get("data") or {}).get("productBySkuId") or {}).get("reviews") or {}).get("results") or []
+    reviews = []
+    if path.exists():
+        data = read_json(path)
+        reviews = (((data.get("data") or {}).get("productBySkuId") or {}).get("reviews") or {}).get("results") or []
+    if not reviews:
+        for payload in detail_payloads(sku):
+            for event in payload.get("events", []):
+                data = event_data(event)
+                product = data.get("productBySkuId") if isinstance(data, dict) else None
+                if not isinstance(product, dict) or str(product.get("skuId") or "") != str(sku):
+                    continue
+                fallback_reviews = ((product.get("reviews") or {}).get("results") or [])
+                if fallback_reviews:
+                    reviews = fallback_reviews
+                    break
+            if reviews:
+                break
     chunks = []
     for index, review in enumerate(reviews[:20], 1):
         text = compact_text(review.get("text"))
         if text:
             chunks.append(f"review{index} - {text}")
     return " ||| ".join(chunks)
+
+
+def recommended_percent_from_detail(sku):
+    for payload in detail_payloads(sku):
+        stack = [payload]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                if str(current.get("skuId") or "") == str(sku):
+                    review_info = current.get("reviewInfo") or {}
+                    value = review_info.get("recommendedPercent")
+                    if value not in ("", None):
+                        return value
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+    return ""
 
 
 def sample_fields():
@@ -1190,9 +1613,12 @@ def output_row(target):
     detail_html_path = detail_paths(sku)["html"]
     html_text = detail_html_path.read_text(encoding="utf-8", errors="replace") if detail_html_path.exists() else ""
     selector_values = detail_selector_values(html_text)
-    products, variations = products_from_detail(sku)
+    products = products_from_detail(sku)
+    compare_similar_names = compare_similar_names_from_detail(sku)
     price = best_price(products)
     review_info = first_value(products, "reviewInfo") or {}
+    review_count = review_count_number(review_info.get("reviewCount"), target.get("review_count"))
+    external_reviews = is_external_review_source(target, review_info)
     pickup = best_path(products, ["fulfillmentOptions", "ispuDetails", 0, "ispuAvailability", 0], ("maxDate",))
     delivery = best_path(
         products,
@@ -1216,17 +1642,21 @@ def output_row(target):
         "item": bsin,
         "account_name": "Bestbuy",
         "page_type": "bsr" if target.get("target_source") == "bsr_only_backfill" else "main",
-        "count_of_reviews": int_commas(review_info.get("reviewCount") or target.get("review_count")),
+        "count_of_reviews": "0" if external_reviews else int_commas(review_info.get("reviewCount") or target.get("review_count")),
         "retailer_sku_name": first_non_empty(product_name, selector_values.get("retailer_sku_name")),
         "product_url": product_url,
-        "star_rating": first_non_empty(
+        "star_rating": "Not yet reviewed"
+        if external_reviews
+        else first_non_empty(
             review_info.get("averageRating"),
             target.get("rating"),
             selector_values.get("top_star_rating"),
             selector_values.get("star_rating"),
             "Not yet reviewed",
         ),
-        "count_of_star_ratings": int_commas(review_info.get("reviewCount") or target.get("review_count")),
+        "count_of_star_ratings": "0"
+        if external_reviews
+        else int_commas(review_info.get("reviewCount") or target.get("review_count")),
         "screen_size": first_non_empty(screen, selector_values.get("screen_size")),
         "final_sku_price": first_non_empty(
             money(price.get("displayableCustomerPrice") or price.get("customerPrice") or target.get("customer_price")),
@@ -1242,49 +1672,58 @@ def output_row(target):
             money_int(price.get("totalSavings") or target.get("total_savings")),
             selector_values.get("savings"),
         ),
-        "offer": offer_count(products) or target.get("offer_count", ""),
+        "offer": first_non_empty(target.get("offer"), target.get("offer_count")),
         "pick_up_availability": first_non_empty(
+            target.get("pick_up_availability"),
             selector_values.get("pick_up_availability"),
-            date_to_phrase("Pick up", pickup.get("maxDate") if isinstance(pickup, dict) else ""),
+            pickup_text(pickup),
         ),
         "fastest_delivery": first_non_empty(
+            target.get("fastest_delivery"),
             selector_values.get("fastest_delivery"),
+            fastest_delivery_text(best_shipping_availability(products)),
             fastest_delivery_from_html(html_text),
         ),
         "delivery_availability": first_non_empty(
+            target.get("delivery_availability"),
             selector_values.get("delivery_availability"),
+            delivery_text(delivery),
             delivery_from_html(html_text),
-            date_to_phrase("Delivery as soon as", delivery_slot),
+            date_to_relative_or_phrase("Delivery as soon as", delivery_slot),
         ),
         "shipping_info": "",
         "sku_status": "Sponsored" if target.get("is_sponsored") in {"1", "true", "True"} else "",
         "hhp_storage": hhp_attrs.get("hhp_storage", ""),
         "hhp_color": hhp_attrs.get("hhp_color", ""),
         "hhp_carrier": hhp_attrs.get("hhp_carrier", ""),
-        "detailed_review_content": review20_content(sku),
+        "detailed_review_content": "" if external_reviews else review20_content(sku),
         "summarized_review_content": "",
         "top_mentions": "",
-        "recommendation_intent": first_non_empty(
-            recommendation_phrase(selector_values.get("recommendation_intent")),
-            recommendation_phrase(selector_values.get("reviewpage_recommendation_intent_fallback")),
-            recommendation_phrase(selector_values.get("reviewpage_recommendation_intent_fallback2")),
-            recommendation_phrase(selector_values.get("reviewpage_recommendation_intent_fallback3")),
-            recommendation_phrase(selector_values.get("reviewpage_recommendation_intent_fallback4")),
+        "recommendation_intent": ""
+        if external_reviews
+        else recommendation_intent_value(
+            review_count,
+            selector_values.get("recommendation_intent"),
+            selector_values.get("reviewpage_recommendation_intent_fallback"),
+            selector_values.get("reviewpage_recommendation_intent_fallback2"),
+            selector_values.get("reviewpage_recommendation_intent_fallback3"),
+            selector_values.get("reviewpage_recommendation_intent_fallback4"),
             recommendation_from_html(html_text),
+            recommended_percent_from_detail(sku),
             recommendation(products),
         ),
         "main_rank": target.get("main_rank", ""),
         "bsr_rank": target.get("bsr_rank", ""),
         "promotion_position": target.get("promotion_position", ""),
         "trend_rank": target.get("trend_rank", ""),
-        "retailer_sku_name_similar": " ||| ".join(variations[:4]),
+        "retailer_sku_name_similar": " ||| ".join(compare_similar_names[:4]),
         "estimated_annual_electricity_use": clean_energy(energy),
         "promotion_type": target.get("promotion_type", ""),
         "calendar_week": f"w{crawl_dt.isocalendar().week}",
         "crawl_datetime": crawl_dt.strftime("%Y-%m-%d %H:%M"),
         "crawl_strdatetime": crawl_dt.strftime("%Y-%m-%d %H:%M"),
         "model_year": model_year,
-        "batch_id": f"bestbuy_{RUN_DATE}",
+        "batch_id": RUN_BATCH_ID,
         "country": "SEA",
     }
     for field, value in selector_values.items():
@@ -1299,6 +1738,7 @@ def build_outputs(targets):
         sku = str(target.get("sku_id") or "").strip()
         dmeta = read_json(detail_paths(sku)["meta"])
         rmeta = read_json(review_paths(sku)["meta"])
+        cmeta = read_json(compare_paths(sku)["meta"])
         rows.append(output_row(target))
         if not dmeta.get("success"):
             failures.append(
@@ -1311,7 +1751,8 @@ def build_outputs(targets):
                     "retryable": str(int(int(dmeta.get("attempt", 0) or 0) < MAX_ATTEMPTS)),
                 }
             )
-        if not rmeta.get("success"):
+        review_required = review20_required_for_target(target, sku)
+        if review_required and not rmeta.get("success"):
             failures.append(
                 {
                     "sku_id": sku,
@@ -1320,6 +1761,17 @@ def build_outputs(targets):
                     "status_code": rmeta.get("status_code", ""),
                     "error": rmeta.get("error", "missing_review20"),
                     "retryable": str(int(int(rmeta.get("attempt", 0) or 0) < MAX_ATTEMPTS)),
+                }
+            )
+        if FETCH_COMPARE and not cmeta.get("success"):
+            failures.append(
+                {
+                    "sku_id": sku,
+                    "stage": "compare",
+                    "attempt": cmeta.get("attempt", 0),
+                    "status_code": cmeta.get("status_code", ""),
+                    "error": cmeta.get("error", "missing_compare"),
+                    "retryable": str(int(int(cmeta.get("attempt", 0) or 0) < MAX_ATTEMPTS)),
                 }
             )
     return rows, failures
@@ -1331,10 +1783,12 @@ def main():
     output_targets = target_rows(apply_filters=False)
     api_key = "" if REBUILD_ONLY else os.getenv("ZENROWS_API_KEY")
     client = ZenRowsClient(api_key) if api_key else None
-    can_fetch_network = not REBUILD_ONLY and ("direct" in fetch_transports() or client is not None)
+    transports = [] if REBUILD_ONLY else fetch_transports()
+    can_fetch_network = not REBUILD_ONLY and ("zenrows" in transports and client is not None)
 
     RAW_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
     RAW_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_COMPARE_DIR.mkdir(parents=True, exist_ok=True)
     PARSED_DIR.mkdir(parents=True, exist_ok=True)
     BENCHMARKS_DIR.mkdir(parents=True, exist_ok=True)
     if not REBUILD_ONLY and DETAIL_BENCHMARKS_CSV.exists():
@@ -1353,10 +1807,11 @@ def main():
             missing = [
                 row.get("sku_id")
                 for row in targets
-                if not detail_success(row.get("sku_id")) or not review_success(row.get("sku_id"))
+                if not detail_success(row.get("sku_id"))
+                or (review20_required_for_target(row, row.get("sku_id")) and not review_success(row.get("sku_id")))
             ]
         if missing:
-            raise RuntimeError("Enable direct fetch, set ZENROWS_API_KEY, or provide cached detail/review files for all selected SKUs")
+            raise RuntimeError("Set ZENROWS_API_KEY or provide cached detail/review files for all selected SKUs")
 
     benchmark_lock = Lock()
 
@@ -1364,6 +1819,7 @@ def main():
         sku = str(target.get("sku_id") or "").strip()
         fetched_detail = False
         fetched_review = False
+        fetched_compare = False
         if STAGE in {"all", "detail"}:
             should_fetch_detail = can_fetch_network and not detail_success(sku)
             dmeta = fetch_detail(client, target) if should_fetch_detail else read_json(detail_paths(sku)["meta"])
@@ -1371,44 +1827,62 @@ def main():
         else:
             dmeta = read_json(detail_paths(sku)["meta"])
         if STAGE in {"all", "review"}:
-            should_fetch_review = can_fetch_network and dmeta.get("success") and not review_success(sku)
+            should_fetch_review = (
+                can_fetch_network
+                and dmeta.get("success")
+                and review20_required_for_target(target, sku)
+                and not review_success(sku)
+            )
             rmeta = fetch_review20(client, target) if should_fetch_review else read_json(review_paths(sku)["meta"])
             fetched_review = bool(should_fetch_review)
         else:
             rmeta = read_json(review_paths(sku)["meta"])
+        if FETCH_COMPARE and STAGE in {"all", "detail"}:
+            should_fetch_compare = can_fetch_network and dmeta.get("success") and not compare_success(sku)
+            cmeta = fetch_compare(client, target) if should_fetch_compare else read_json(compare_paths(sku)["meta"])
+            fetched_compare = bool(should_fetch_compare)
+        else:
+            cmeta = read_json(compare_paths(sku)["meta"])
         with benchmark_lock:
             append_detail_benchmark(target, DETAIL_ROOT, DETAIL_BENCHMARKS_CSV)
-        return index, sku, dmeta, rmeta, fetched_detail, fetched_review
+        return index, sku, dmeta, rmeta, cmeta, fetched_detail, fetched_review, fetched_compare
 
     detail_cost = 0.0
     review_cost = 0.0
+    compare_cost = 0.0
     if REBUILD_ONLY:
         print(f"rebuild_only=1 output_targets={len(output_targets)}")
     elif WORKERS > 1 and len(targets) > 1:
         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
             futures = [executor.submit(process_target, index, target) for index, target in enumerate(targets, 1)]
             for future in as_completed(futures):
-                index, sku, dmeta, rmeta, fetched_detail, fetched_review = future.result()
+                index, sku, dmeta, rmeta, cmeta, fetched_detail, fetched_review, fetched_compare = future.result()
                 if fetched_detail:
                     detail_cost += float(dmeta.get("x_request_cost") or 0)
                 if fetched_review:
                     review_cost += float(rmeta.get("x_request_cost") or 0)
+                if fetched_compare:
+                    compare_cost += float(cmeta.get("x_request_cost") or 0)
                 print(
                     f"[{index}/{len(targets)}] sku={sku} "
                     f"detail={dmeta.get('success')} attempt={dmeta.get('attempt')} "
+                    f"compare={cmeta.get('success')} attempt={cmeta.get('attempt')} "
                     f"review={rmeta.get('success')} attempt={rmeta.get('attempt')} "
                     f"reviews={rmeta.get('review_count_returned', '')}"
                 )
     else:
         for index, target in enumerate(targets, 1):
-            index, sku, dmeta, rmeta, fetched_detail, fetched_review = process_target(index, target)
+            index, sku, dmeta, rmeta, cmeta, fetched_detail, fetched_review, fetched_compare = process_target(index, target)
             if fetched_detail:
                 detail_cost += float(dmeta.get("x_request_cost") or 0)
             if fetched_review:
                 review_cost += float(rmeta.get("x_request_cost") or 0)
+            if fetched_compare:
+                compare_cost += float(cmeta.get("x_request_cost") or 0)
             print(
                 f"[{index}/{len(targets)}] sku={sku} "
                 f"detail={dmeta.get('success')} attempt={dmeta.get('attempt')} "
+                f"compare={cmeta.get('success')} attempt={cmeta.get('attempt')} "
                 f"review={rmeta.get('success')} attempt={rmeta.get('attempt')} "
                 f"reviews={rmeta.get('review_count_returned', '')}"
             )
@@ -1443,8 +1917,9 @@ def main():
         "failure_count": len(failures),
         "detail_cost_usd_this_run": detail_cost,
         "review_cost_usd_this_run": review_cost,
-        "total_cost_usd_this_run": detail_cost + review_cost,
-        "total_cost_krw_1550_this_run": round((detail_cost + review_cost) * KRW_PER_USD, 2),
+        "compare_cost_usd_this_run": compare_cost,
+        "total_cost_usd_this_run": detail_cost + review_cost + compare_cost,
+        "total_cost_krw_1550_this_run": round((detail_cost + review_cost + compare_cost) * KRW_PER_USD, 2),
         "detail_rows_csv": rel_path(DETAIL_ROWS_CSV),
         "failures_csv": rel_path(FAILURES_CSV),
         "detail_benchmarks_csv": rel_path(DETAIL_BENCHMARKS_CSV),
